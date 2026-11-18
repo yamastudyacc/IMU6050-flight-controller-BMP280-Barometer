@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : MPU6050 + BMP280 Barometer + MAVLink v2 over USB CDC + PID Servo
+  * @brief          : MPU6050 + BMP280 + MAVLink v2 (USB CDC & UART1 Radio) + PID
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -50,6 +50,7 @@ typedef struct {
 #define COMP_ID_COMP      2U
 
 #define BARO_UPDATE_MS    50U
+#define RADIO_TELEM_MS    50U          /* Kirim telemetri radio USART1 tiap 50 ms (20 Hz) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -109,12 +110,14 @@ uint32_t waktu_sekarang = 0;
 uint32_t waktu_sebelumnya = 0;
 uint32_t waktu_hb = 0;
 uint32_t waktu_led = 0;
+uint32_t waktu_radio = 0;
 
 mavlink_message_t msg_kalman;
 mavlink_message_t msg_comp;
 mavlink_message_t msg_hb;
 mavlink_message_t msg_vfr;
-uint8_t tx_buf[MAVLINK_MAX_PACKET_LEN * 4];
+mavlink_message_t msg_servo;
+uint8_t tx_buf[MAVLINK_MAX_PACKET_LEN * 5];
 
 /* ------------------------------- PID & Servo ---------------------------- */
 PID_t pid_roll  = { .kp = 7.5f, .ki = 1.2f, .kd = 0.65f, .integral = 0.0f, .i_limit = 120.0f, .out_limit = 400.0f };
@@ -142,7 +145,7 @@ float trim_roll_R = 0.0f;
 float trim_pitch  = 0.0f;
 float trim_yaw    = 0.0f;
 
-/* Variabel output PWM akhir (1000 - 2000 us) untuk dipantau di Live Expressions */
+/* Variabel output PWM akhir (1000 - 2000 us) untuk dipantau di Live Expressions & GCS */
 uint16_t pwm_aileron_L = 1500U;   /* PA6 (TIM3_CH1) - Aileron Kiri */
 uint16_t pwm_aileron_R = 1500U;   /* PA7 (TIM3_CH2) - Aileron Kanan */
 uint16_t pwm_elevator  = 1500U;   /* PB0 (TIM3_CH3) - Elevator */
@@ -455,6 +458,7 @@ int main(void)
     waktu_sebelumnya = waktu_baro;
     waktu_hb = waktu_baro;
     waktu_led = waktu_baro;
+    waktu_radio = waktu_baro;
 
     /* Aktifkan DLPF ~42 Hz pada register 0x1A MPU6050 untuk meredam getaran motor */
     uint8_t dlpf_cfg = 0x03U;
@@ -628,7 +632,7 @@ int main(void)
             }
         }
 
-        /* Paket MAVLink */
+        /* ---------------- PAKET TELEMETRI MAVLINK V2 ---------------- */
         uint16_t total_len = 0U;
 
         if ((waktu_sekarang - waktu_hb) >= 1000U)
@@ -668,9 +672,27 @@ int main(void)
             ketinggian_filter, climb_mps);
         total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_vfr);
 
+        /* Data output PWM servo (us) dikirim ke GCS (servo1..servo4) */
+        mavlink_msg_servo_output_raw_pack(
+            SYS_ID, COMP_ID_KALMAN, &msg_servo,
+            waktu_sekarang * 1000U, 0U,
+            pwm_aileron_L, pwm_aileron_R, pwm_elevator, pwm_rudder,
+            0U, 0U, 0U, 0U,
+            0U, 0U, 0U, 0U,
+            0U, 0U, 0U, 0U);
+        total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_servo);
+
         if (total_len > 0U)
         {
+            /* 1. Kirim ke PC via USB CDC (pengujian meja) */
             (void)CDC_Transmit_FS(tx_buf, total_len);
+
+            /* 2. Kirim ke Radio Telemetri via USART1 PA9/PA10 (20 Hz untuk terbang) */
+            if ((waktu_sekarang - waktu_radio) >= RADIO_TELEM_MS)
+            {
+                waktu_radio = waktu_sekarang;
+                (void)HAL_UART_Transmit(&huart1, tx_buf, total_len, 35U);
+            }
         }
 
         /* Kedipkan LED PC13 setiap 250 ms sebagai tanda sistem berjalan normal */
@@ -847,7 +869,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 57600;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
