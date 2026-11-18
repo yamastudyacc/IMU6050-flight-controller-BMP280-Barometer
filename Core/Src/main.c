@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : MPU6050 + BMP280 Barometer + MAVLink v2 over USB CDC
+  * @brief          : MPU6050 + BMP280 Barometer + MAVLink v2 over USB CDC + PID Servo
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -85,7 +85,10 @@ float kalmanX = 0.0f, kalmanY = 0.0f, kalmanZ = 0.0f;
 float err_gyroX = 1.0f, err_gyroY = 1.0f;
 float kalman_gainX = 0.0f, kalman_gainY = 0.0f;
 float Q_drift = 0.003f;
-float E_acc = 0.03f;
+float E_acc = 2.0f;
+float gyroX_bias = 0.0f, gyroY_bias = 0.0f, gyroZ_bias = 0.0f;
+uint8_t i2c_err_count = 0U;
+uint8_t sensor_failsafe = 0U;
 
 /* ------------------------------- BMP280 --------------------------------- */
 uint8_t bmp280_addr = 0U;
@@ -112,6 +115,7 @@ mavlink_message_t msg_comp;
 mavlink_message_t msg_hb;
 mavlink_message_t msg_vfr;
 uint8_t tx_buf[MAVLINK_MAX_PACKET_LEN * 4];
+
 /* ------------------------------- PID & Servo ---------------------------- */
 PID_t pid_roll  = { .kp = 7.5f, .ki = 1.2f, .kd = 0.65f, .integral = 0.0f, .i_limit = 120.0f, .out_limit = 400.0f };
 PID_t pid_pitch = { .kp = 8.0f, .ki = 1.2f, .kd = 0.70f, .integral = 0.0f, .i_limit = 120.0f, .out_limit = 400.0f };
@@ -126,20 +130,23 @@ uint8_t enable_alt_hold = 0U;
 float target_alt   = 0.0f;   /* Target ketinggian (meter) */
 float target_pitch = 0.0f;   /* Sudut pitch yang diminta ke elevator (derajat) */
 
-/* Arah gerak servo (+1.0f atau -1.0f): ubah ke -1.0f jika arah gerak servo terbalik */
-float dir_roll  = 1.0f;
-float dir_pitch = 1.0f;
-float dir_yaw   = 1.0f;
+/* Arah gerak servo (+1.0f atau -1.0f): ubah tanda jika arah gerak servo terbalik */
+float dir_roll_L =  1.0f;
+float dir_roll_R = -1.0f;    /* Servo kanan berlawanan arah dengan kiri */
+float dir_pitch  =  1.0f;
+float dir_yaw    =  1.0f;
 
 /* Trim mekanik (us) jika posisi netral linkage sedikit meleset dari 1500 us */
-float trim_roll  = 0.0f;
-float trim_pitch = 0.0f;
-float trim_yaw   = 0.0f;
+float trim_roll_L = 0.0f;
+float trim_roll_R = 0.0f;
+float trim_pitch  = 0.0f;
+float trim_yaw    = 0.0f;
 
 /* Variabel output PWM akhir (1000 - 2000 us) untuk dipantau di Live Expressions */
-uint16_t pwm_aileron  = 1500U;
-uint16_t pwm_elevator = 1500U;
-uint16_t pwm_rudder   = 1500U;
+uint16_t pwm_aileron_L = 1500U;   /* PA6 (TIM3_CH1) - Aileron Kiri */
+uint16_t pwm_aileron_R = 1500U;   /* PA7 (TIM3_CH2) - Aileron Kanan */
+uint16_t pwm_elevator  = 1500U;   /* PB0 (TIM3_CH3) - Elevator */
+uint16_t pwm_rudder    = 1500U;   /* PB1 (TIM3_CH4) - Rudder (opsional) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -226,7 +233,7 @@ float BMP280_ReadPressure(void)
     }
 
     if (HAL_I2C_Mem_Read(&hi2c1, bmp280_addr, 0xF7U,
-                         I2C_MEMADD_SIZE_8BIT, raw, sizeof(raw), 50U) != HAL_OK)
+                         I2C_MEMADD_SIZE_8BIT, raw, sizeof(raw), 5U) != HAL_OK)
     {
         return NAN;
     }
@@ -320,6 +327,7 @@ void BMP280_UpdateAltitude(void)
         altitude_previous = ketinggian_filter;
     }
 }
+
 static float clamp_f(float val, float min_v, float max_v)
 {
     if (val < min_v) return min_v;
@@ -447,22 +455,65 @@ int main(void)
     waktu_sebelumnya = waktu_baro;
     waktu_hb = waktu_baro;
     waktu_led = waktu_baro;
+
     /* Aktifkan DLPF ~42 Hz pada register 0x1A MPU6050 untuk meredam getaran motor */
-        uint8_t dlpf_cfg = 0x03U;
-        if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x1AU,
-                              I2C_MEMADD_SIZE_8BIT, &dlpf_cfg, 1U, HAL_MAX_DELAY) != HAL_OK)
+    uint8_t dlpf_cfg = 0x03U;
+    if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x1AU,
+                          I2C_MEMADD_SIZE_8BIT, &dlpf_cfg, 1U, HAL_MAX_DELAY) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* Kalibrasi 500 sampel bias gyro & sudut awal saat pesawat diam (~1 detik) */
+    float sum_gx = 0.0f, sum_gy = 0.0f, sum_gz = 0.0f;
+    uint16_t gyro_samples = 0U;
+
+    for (uint16_t i = 0U; i < 500U; i++)
+    {
+        if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x3BU,
+                             I2C_MEMADD_SIZE_8BIT, data_mentah, 14U, 5U) == HAL_OK)
         {
-            Error_Handler();
+            int16_t ax = (int16_t)((data_mentah[0] << 8) | data_mentah[1]);
+            int16_t ay = (int16_t)((data_mentah[2] << 8) | data_mentah[3]);
+            int16_t az = (int16_t)((data_mentah[4] << 8) | data_mentah[5]);
+            int16_t gx = (int16_t)((data_mentah[8] << 8) | data_mentah[9]);
+            int16_t gy = (int16_t)((data_mentah[10] << 8) | data_mentah[11]);
+            int16_t gz = (int16_t)((data_mentah[12] << 8) | data_mentah[13]);
+
+            sum_gx += (gx / 131.0f);
+            sum_gy += (gy / 131.0f);
+            sum_gz += (gz / 131.0f);
+            gyro_samples++;
+
+            /* Set sudut awal filter mengikuti posisi pesawat saat diam */
+            if (gyro_samples == 1U)
+            {
+                kalmanX = atan2f((float)ay, (float)az) * RAD_TO_DEG;
+                kalmanY = atan2f((float)(-ax), (float)az) * RAD_TO_DEG;
+                compX = kalmanX;
+                compY = kalmanY;
+            }
         }
+        HAL_Delay(2U);
+    }
 
-        /* Mulai sinyal PWM 50 Hz pada PA6, PA7, PB0 dan set posisi netral 1500 us */
-        HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-        HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+    if (gyro_samples > 0U)
+    {
+        gyroX_bias = sum_gx / (float)gyro_samples;
+        gyroY_bias = sum_gy / (float)gyro_samples;
+        gyroZ_bias = sum_gz / (float)gyro_samples;
+    }
 
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1500U);
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1500U);
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 1500U);
+    /* Mulai sinyal PWM 50 Hz pada PA6, PA7, PB0, PB1 dan set posisi netral 1500 us */
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1500U);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1500U);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 1500U);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 1500U);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -471,18 +522,21 @@ int main(void)
     {
         waktu_sekarang = HAL_GetTick();
         dt = (waktu_sekarang - waktu_sebelumnya) / 1000.0f;
-        if (dt <= 0.0f)
+        if (dt <= 0.001f || dt > 0.05f)
         {
-            dt = 0.001f;
+            dt = 0.01f;
         }
 
         /* Baca dan filter ketinggian barometer tiap 50 ms */
         BMP280_UpdateAltitude();
 
-        /* Baca 14 byte data MPU6050 */
+        /* Baca 14 byte data MPU6050 dengan timeout 5 ms */
         if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x3BU,
-                             I2C_MEMADD_SIZE_8BIT, data_mentah, 14U, HAL_MAX_DELAY) == HAL_OK)
+                             I2C_MEMADD_SIZE_8BIT, data_mentah, 14U, 5U) == HAL_OK)
         {
+            i2c_err_count = 0U;
+            sensor_failsafe = 0U;
+
             accX_raw  = (int16_t)((data_mentah[0] << 8) | data_mentah[1]);
             accY_raw  = (int16_t)((data_mentah[2] << 8) | data_mentah[3]);
             accZ_raw  = (int16_t)((data_mentah[4] << 8) | data_mentah[5]);
@@ -495,9 +549,9 @@ int main(void)
             accY_g = accY_raw / 16384.0f;
             accZ_g = accZ_raw / 16384.0f;
             suhu_c = (temp_raw / 340.0f) + 36.53f;
-            gyroX_dps = gyroX_raw / 131.0f;
-            gyroY_dps = gyroY_raw / 131.0f;
-            gyroZ_dps = gyroZ_raw / 131.0f;
+            gyroX_dps = (gyroX_raw / 131.0f) - gyroX_bias;
+            gyroY_dps = (gyroY_raw / 131.0f) - gyroY_bias;
+            gyroZ_dps = (gyroZ_raw / 131.0f) - gyroZ_bias;
 
             /* Complementary Filter */
             sudut_accX = atan2f(accY_g, accZ_g) * RAD_TO_DEG;
@@ -523,93 +577,117 @@ int main(void)
             kalman_gainY = err_gyroY / (err_gyroY + E_acc);
             kalmanY += kalman_gainY * (sudut_accY - kalmanY);
             err_gyroY = (1.0f - kalman_gainY) * err_gyroY;
+
             /* ---------------- KENDALI PID STABILISASI SERVO ---------------- */
-                        /* 1. Outer Loop Barometer: tentukan target sudut Pitch */
-                        if (enable_alt_hold != 0U)
-                        {
-                            float err_alt = target_alt - ketinggian_filter;
-                            target_pitch = clamp_f((kp_alt * err_alt) - (kd_alt * climb_mps), -10.0f, 10.0f);
-                        }
-                        else
-                        {
-                            target_pitch = 0.0f;
-                        }
-
-                        /* 2. Inner Loop IMU: hitung koreksi mikrodetik PWM tiap sumbu */
-                        float out_roll  = PID_Compute(&pid_roll,  0.0f,         kalmanX, gyroX_dps, dt);
-                        float out_pitch = PID_Compute(&pid_pitch, target_pitch, kalmanY, gyroY_dps, dt);
-                        float out_yaw   = clamp_f(-kd_yaw * gyroZ_dps, -350.0f, 350.0f);
-
-                        /* 3. Konversi ke lebar pulsa 1000 - 2000 us dan kirim ke TIM3 */
-                        pwm_aileron  = (uint16_t)(clamp_f(1500.0f + trim_roll  + (dir_roll  * out_roll),  1000.0f, 2000.0f) + 0.5f);
-                        pwm_elevator = (uint16_t)(clamp_f(1500.0f + trim_pitch + (dir_pitch * out_pitch), 1000.0f, 2000.0f) + 0.5f);
-                        pwm_rudder   = (uint16_t)(clamp_f(1500.0f + trim_yaw   + (dir_yaw   * out_yaw),   1000.0f, 2000.0f) + 0.5f);
-
-                        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm_aileron);  /* PA6 */
-                        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm_elevator); /* PA7 */
-                        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm_rudder);   /* PB0 */
-
-            /* Paket MAVLink */
-            uint16_t total_len = 0U;
-
-            if ((waktu_sekarang - waktu_hb) >= 1000U)
+            if (enable_alt_hold != 0U)
             {
-                waktu_hb = waktu_sekarang;
-                mavlink_msg_heartbeat_pack(
-                    SYS_ID, COMP_ID_KALMAN, &msg_hb,
-                    MAV_TYPE_GENERIC, MAV_AUTOPILOT_GENERIC,
-                    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0U, MAV_STATE_ACTIVE);
-                total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_hb);
+                float err_alt = target_alt - ketinggian_filter;
+                target_pitch = clamp_f((kp_alt * err_alt) - (kd_alt * climb_mps), -10.0f, 10.0f);
+            }
+            else
+            {
+                target_pitch = 0.0f;
             }
 
-            float gx_rad = gyroX_dps * DEG_TO_RAD;
-            float gy_rad = gyroY_dps * DEG_TO_RAD;
-            float gz_rad = gyroZ_dps * DEG_TO_RAD;
+            float out_roll  = PID_Compute(&pid_roll,  0.0f,         kalmanX, gyroX_dps, dt);
+            float out_pitch = PID_Compute(&pid_pitch, target_pitch, kalmanY, gyroY_dps, dt);
+            float out_yaw   = clamp_f(-kd_yaw * gyroZ_dps, -350.0f, 350.0f);
 
-            mavlink_msg_attitude_pack(
-                SYS_ID, COMP_ID_KALMAN, &msg_kalman, waktu_sekarang,
-                kalmanX * DEG_TO_RAD, kalmanY * DEG_TO_RAD, kalmanZ * DEG_TO_RAD,
-                gx_rad, gy_rad, gz_rad);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_kalman);
+            pwm_aileron_L = (uint16_t)(clamp_f(1500.0f + trim_roll_L + (dir_roll_L * out_roll),  1000.0f, 2000.0f) + 0.5f);
+            pwm_aileron_R = (uint16_t)(clamp_f(1500.0f + trim_roll_R + (dir_roll_R * out_roll),  1000.0f, 2000.0f) + 0.5f);
+            pwm_elevator  = (uint16_t)(clamp_f(1500.0f + trim_pitch  + (dir_pitch  * out_pitch), 1000.0f, 2000.0f) + 0.5f);
+            pwm_rudder    = (uint16_t)(clamp_f(1500.0f + trim_yaw    + (dir_yaw    * out_yaw),   1000.0f, 2000.0f) + 0.5f);
 
-            mavlink_msg_attitude_pack(
-                SYS_ID, COMP_ID_COMP, &msg_comp, waktu_sekarang,
-                compX * DEG_TO_RAD, compY * DEG_TO_RAD, compZ * DEG_TO_RAD,
-                gx_rad, gy_rad, gz_rad);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_comp);
-
-            float heading_deg_f = fmodf(kalmanZ, 360.0f);
-            if (heading_deg_f < 0.0f) heading_deg_f += 360.0f;
-            int16_t heading_deg = (int16_t)heading_deg_f;
-
-            /* Data barometer dikirim melalui field alt (meter) & climb (m/s) pada VFR_HUD */
-            mavlink_msg_vfr_hud_pack(
-                SYS_ID, COMP_ID_KALMAN, &msg_vfr,
-                0.0f, 0.0f, heading_deg, 0U,
-                ketinggian_filter, climb_mps);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_vfr);
-
-            if (total_len > 0U)
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm_aileron_L); /* PA6 - Aileron Kiri */
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm_aileron_R); /* PA7 - Aileron Kanan */
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm_elevator);  /* PB0 - Elevator */
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pwm_rudder);    /* PB1 - Rudder (opsional) */
+        }
+        else
+        {
+            /* Failsafe: jika baca I2C gagal 3x berturut-turut, kembalikan servo ke netral */
+            if (i2c_err_count < 255U)
             {
-                (void)CDC_Transmit_FS(tx_buf, total_len);
+                i2c_err_count++;
             }
-
-            /* Kedipkan LED PC13 setiap 250 ms sebagai tanda sensor berjalan normal */
-            if ((waktu_sekarang - waktu_led) >= 250U)
+            if (i2c_err_count >= 3U)
             {
-                waktu_led = waktu_sekarang;
-                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+                sensor_failsafe = 1U;
+                pid_roll.integral = 0.0f;
+                pid_pitch.integral = 0.0f;
+
+                pwm_aileron_L = 1500U;
+                pwm_aileron_R = 1500U;
+                pwm_elevator  = 1500U;
+                pwm_rudder    = 1500U;
+
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1500U);
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1500U);
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 1500U);
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 1500U);
             }
+        }
+
+        /* Paket MAVLink */
+        uint16_t total_len = 0U;
+
+        if ((waktu_sekarang - waktu_hb) >= 1000U)
+        {
+            waktu_hb = waktu_sekarang;
+            mavlink_msg_heartbeat_pack(
+                SYS_ID, COMP_ID_KALMAN, &msg_hb,
+                MAV_TYPE_GENERIC, MAV_AUTOPILOT_GENERIC,
+                MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0U, MAV_STATE_ACTIVE);
+            total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_hb);
+        }
+
+        float gx_rad = gyroX_dps * DEG_TO_RAD;
+        float gy_rad = gyroY_dps * DEG_TO_RAD;
+        float gz_rad = gyroZ_dps * DEG_TO_RAD;
+
+        mavlink_msg_attitude_pack(
+            SYS_ID, COMP_ID_KALMAN, &msg_kalman, waktu_sekarang,
+            kalmanX * DEG_TO_RAD, kalmanY * DEG_TO_RAD, kalmanZ * DEG_TO_RAD,
+            gx_rad, gy_rad, gz_rad);
+        total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_kalman);
+
+        mavlink_msg_attitude_pack(
+            SYS_ID, COMP_ID_COMP, &msg_comp, waktu_sekarang,
+            compX * DEG_TO_RAD, compY * DEG_TO_RAD, compZ * DEG_TO_RAD,
+            gx_rad, gy_rad, gz_rad);
+        total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_comp);
+
+        float heading_deg_f = fmodf(kalmanZ, 360.0f);
+        if (heading_deg_f < 0.0f) heading_deg_f += 360.0f;
+        int16_t heading_deg = (int16_t)heading_deg_f;
+
+        /* Data barometer dikirim melalui field alt (meter) & climb (m/s) pada VFR_HUD */
+        mavlink_msg_vfr_hud_pack(
+            SYS_ID, COMP_ID_KALMAN, &msg_vfr,
+            0.0f, 0.0f, heading_deg, 0U,
+            ketinggian_filter, climb_mps);
+        total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_vfr);
+
+        if (total_len > 0U)
+        {
+            (void)CDC_Transmit_FS(tx_buf, total_len);
+        }
+
+        /* Kedipkan LED PC13 setiap 250 ms sebagai tanda sistem berjalan normal */
+        if ((waktu_sekarang - waktu_led) >= 250U)
+        {
+            waktu_led = waktu_sekarang;
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
         }
 
         HAL_Delay(10U);
         waktu_sebelumnya = waktu_sekarang;
-    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
+}
 
 /**
   * @brief System Clock Configuration
@@ -674,7 +752,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = 400000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -711,7 +789,7 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
+  htim3.Init.Prescaler = 15;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim3.Init.Period = 19999;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -739,6 +817,10 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
   }
