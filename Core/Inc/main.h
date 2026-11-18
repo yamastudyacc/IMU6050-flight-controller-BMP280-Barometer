@@ -66,10 +66,10 @@ void Error_Handler(void);
 #define BARO_I2C_ADDR         (0x76 << 1) // Ubah ke (0x77 << 1) jika pin SDO barometer ke 3.3V
 
 // Pemetaan Kanal PWM 3 Servo pada TIM3 (PA6, PA7, PB0)
-#define SERVO1_CHANNEL        TIM_CHANNEL_1 // PA6 (Roll)
-#define SERVO2_CHANNEL        TIM_CHANNEL_2 // PA7 (Pitch)
-#define SERVO3_CHANNEL        TIM_CHANNEL_3 // PB0 (Altitude / Elevator)
-
+#define SERVO1_CHANNEL   TIM_CHANNEL_1 // PA6 (Aileron kiri)
+#define SERVO2_CHANNEL   TIM_CHANNEL_2 // PA7 (Elevator)
+#define SERVO3_CHANNEL   TIM_CHANNEL_3 // PB0 (Rudder)
+#define SERVO4_CHANNEL   TIM_CHANNEL_4 // PB1 (Aileron kanan)
 // Batas Lebar Pulsa PWM Servo (dalam mikrodetik)
 #define SERVO_PWM_MIN         1000
 #define SERVO_PWM_NEUTRAL     1500
