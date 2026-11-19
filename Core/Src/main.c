@@ -123,10 +123,9 @@ uint8_t tx_buf[MAVLINK_MAX_PACKET_LEN * 5];
 PID_t pid_roll  = { .kp = 7.5f, .ki = 1.2f, .kd = 0.65f, .integral = 0.0f, .i_limit = 120.0f, .out_limit = 400.0f };
 PID_t pid_pitch = { .kp = 8.0f, .ki = 1.2f, .kd = 0.70f, .integral = 0.0f, .i_limit = 120.0f, .out_limit = 400.0f };
 
-/* Gain Altitude Hold (Outer Loop Barometer -> Target Pitch) & Yaw Damper */
+/* Gain Altitude Hold (Outer Loop Barometer -> Target Pitch) */
 float kp_alt = 2.0f;
 float kd_alt = 1.5f;
-float kd_yaw = 3.0f;
 
 /* Mode Altitude Hold: 0 = Off (target pitch 0 derajat), 1 = On (menahan ketinggian target_alt) */
 uint8_t enable_alt_hold = 0U;
@@ -137,19 +136,16 @@ float target_pitch = 0.0f;   /* Sudut pitch yang diminta ke elevator (derajat) *
 float dir_roll_L =  1.0f;
 float dir_roll_R = -1.0f;    /* Servo kanan berlawanan arah dengan kiri */
 float dir_pitch  =  1.0f;
-float dir_yaw    =  1.0f;
 
 /* Trim mekanik (us) jika posisi netral linkage sedikit meleset dari 1500 us */
 float trim_roll_L = 0.0f;
 float trim_roll_R = 0.0f;
 float trim_pitch  = 0.0f;
-float trim_yaw    = 0.0f;
 
 /* Variabel output PWM akhir (1000 - 2000 us) untuk dipantau di Live Expressions & GCS */
 uint16_t pwm_aileron_L = 1500U;   /* PA6 (TIM3_CH1) - Aileron Kiri */
 uint16_t pwm_aileron_R = 1500U;   /* PA7 (TIM3_CH2) - Aileron Kanan */
 uint16_t pwm_elevator  = 1500U;   /* PB0 (TIM3_CH3) - Elevator */
-uint16_t pwm_rudder    = 1500U;   /* PB1 (TIM3_CH4) - Rudder (opsional) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -508,16 +504,14 @@ int main(void)
         gyroZ_bias = sum_gz / (float)gyro_samples;
     }
 
-    /* Mulai sinyal PWM 50 Hz pada PA6, PA7, PB0, PB1 dan set posisi netral 1500 us */
+    /* Mulai sinyal PWM 50 Hz pada PA6, PA7, PB0 dan set posisi netral 1500 us */
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
 
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1500U);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1500U);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 1500U);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 1500U);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -595,17 +589,14 @@ int main(void)
 
             float out_roll  = PID_Compute(&pid_roll,  0.0f,         kalmanX, gyroX_dps, dt);
             float out_pitch = PID_Compute(&pid_pitch, target_pitch, kalmanY, gyroY_dps, dt);
-            float out_yaw   = clamp_f(-kd_yaw * gyroZ_dps, -350.0f, 350.0f);
 
             pwm_aileron_L = (uint16_t)(clamp_f(1500.0f + trim_roll_L + (dir_roll_L * out_roll),  1000.0f, 2000.0f) + 0.5f);
             pwm_aileron_R = (uint16_t)(clamp_f(1500.0f + trim_roll_R + (dir_roll_R * out_roll),  1000.0f, 2000.0f) + 0.5f);
             pwm_elevator  = (uint16_t)(clamp_f(1500.0f + trim_pitch  + (dir_pitch  * out_pitch), 1000.0f, 2000.0f) + 0.5f);
-            pwm_rudder    = (uint16_t)(clamp_f(1500.0f + trim_yaw    + (dir_yaw    * out_yaw),   1000.0f, 2000.0f) + 0.5f);
 
             __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm_aileron_L); /* PA6 - Aileron Kiri */
             __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm_aileron_R); /* PA7 - Aileron Kanan */
             __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm_elevator);  /* PB0 - Elevator */
-            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pwm_rudder);    /* PB1 - Rudder (opsional) */
         }
         else
         {
@@ -623,12 +614,10 @@ int main(void)
                 pwm_aileron_L = 1500U;
                 pwm_aileron_R = 1500U;
                 pwm_elevator  = 1500U;
-                pwm_rudder    = 1500U;
 
                 __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1500U);
                 __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1500U);
                 __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 1500U);
-                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 1500U);
             }
         }
 
@@ -672,11 +661,11 @@ int main(void)
             ketinggian_filter, climb_mps);
         total_len += (uint16_t)mavlink_msg_to_send_buffer(&tx_buf[total_len], &msg_vfr);
 
-        /* Data output PWM servo (us) dikirim ke GCS (servo1..servo4) */
+        /* Data output PWM servo (us) dikirim ke GCS (servo1..servo3) */
         mavlink_msg_servo_output_raw_pack(
             SYS_ID, COMP_ID_KALMAN, &msg_servo,
             waktu_sekarang * 1000U, 0U,
-            pwm_aileron_L, pwm_aileron_R, pwm_elevator, pwm_rudder,
+            pwm_aileron_L, pwm_aileron_R, pwm_elevator, 0U,
             0U, 0U, 0U, 0U,
             0U, 0U, 0U, 0U,
             0U, 0U, 0U, 0U);
@@ -827,7 +816,7 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
+  sConfigOC.Pulse = 1500;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
@@ -839,10 +828,6 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
   }
