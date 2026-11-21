@@ -114,6 +114,18 @@ typedef struct {
     uint16_t elevator;     /* PB0 (TIM3_CH3) - Elevator */
     uint16_t rudder;       /* PB1 (TIM3_CH4) - Rudder */
 } PWM_Servo_t;
+
+typedef struct {
+    char   name[16];       /* Nama parameter MAVLink (maks 16 karakter) */
+    float *val_ptr;        /* Pointer langsung ke variabel di struct pwm */
+} MavParamItem_t;
+
+#define MAV_RX_BUF_SIZE 256U
+typedef struct {
+    uint8_t buf[MAV_RX_BUF_SIZE];
+    volatile uint16_t head;
+    volatile uint16_t tail;
+} MavRingBuf_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -130,6 +142,7 @@ typedef struct {
 
 #define BARO_UPDATE_MS    50U          /* Update barometer 20 Hz */
 #define TELEM_UPDATE_MS   50U          /* Kirim telemetri MAVLink USB & Radio 20 Hz */
+#define PARAM_STREAM_MS   20U          /* Jeda kirim tiap parameter saat Mission Planner sync */
 
 /* Konstanta SBUS & Mode Terbang */
 #define SBUS_FRAME_LEN    25U
@@ -191,6 +204,34 @@ PWM_Servo_t pwm = {
     .rudder     = 1500U
 };
 
+/* ---------- Tabel Parameter Live Tuning untuk Mission Planner ----------- */
+MavParamItem_t param_table[] = {
+    { "ROLL_KP",     &pwm.pid_roll.kp },
+    { "ROLL_KI",     &pwm.pid_roll.ki },
+    { "ROLL_KD",     &pwm.pid_roll.kd },
+    { "ROLL_IMAX",   &pwm.pid_roll.i_limit },
+    { "PITCH_KP",    &pwm.pid_pitch.kp },
+    { "PITCH_KI",    &pwm.pid_pitch.ki },
+    { "PITCH_KD",    &pwm.pid_pitch.kd },
+    { "PITCH_IMAX",  &pwm.pid_pitch.i_limit },
+    { "ALT_KP",      &pwm.kp_alt },
+    { "ALT_KD",      &pwm.kd_alt },
+    { "YAW_KD",      &pwm.kd_yaw },
+    { "DIR_ROLL_L",  &pwm.dir_roll_L },
+    { "DIR_ROLL_R",  &pwm.dir_roll_R },
+    { "DIR_PITCH",   &pwm.dir_pitch },
+    { "DIR_YAW",     &pwm.dir_yaw },
+    { "TRIM_ROLL_L", &pwm.trim_roll_L },
+    { "TRIM_ROLL_R", &pwm.trim_roll_R },
+    { "TRIM_PITCH",  &pwm.trim_pitch },
+    { "TRIM_YAW",    &pwm.trim_yaw }
+};
+#define PARAM_COUNT ((uint16_t)(sizeof(param_table) / sizeof(param_table[0])))
+
+uint8_t  param_streaming    = 0U;
+uint16_t param_stream_idx   = 0U;
+uint32_t waktu_param_stream = 0U;
+
 /* ------------------------------- MAVLink -------------------------------- */
 uint32_t waktu_sekarang = 0;
 uint32_t waktu_sebelumnya = 0;
@@ -204,9 +245,21 @@ mavlink_message_t msg_gpos;
 mavlink_message_t msg_alt;
 mavlink_message_t msg_vfr;
 mavlink_message_t msg_servo;
+mavlink_message_t msg_param;
 
 uint8_t usb_tx_buf[MAVLINK_MAX_PACKET_LEN * 6];
 uint8_t uart_tx_buf[MAVLINK_MAX_PACKET_LEN * 6];
+uint8_t param_usb_buf[MAVLINK_MAX_PACKET_LEN];
+uint8_t param_uart_buf[MAVLINK_MAX_PACKET_LEN];
+
+MavRingBuf_t mav_usb_rx  = { .head = 0U, .tail = 0U };
+MavRingBuf_t mav_uart_rx = { .head = 0U, .tail = 0U };
+uint8_t radio_rx_byte = 0U;
+
+mavlink_message_t rx_msg_usb;
+mavlink_status_t  rx_status_usb;
+mavlink_message_t rx_msg_uart;
+mavlink_status_t  rx_status_uart;
 
 /* ------------------------------- SBUS RC -------------------------------- */
 uint8_t  sbus_rx_byte = 0U;
@@ -233,10 +286,183 @@ static void MX_USART2_UART_Init(void);
 HAL_StatusTypeDef BMP280_Init(BMP280_t *dev);
 float BMP280_ReadPressure(BMP280_t *dev);
 void BMP280_UpdateAltitude(BMP280_t *dev);
+static void MAVLink_ProcessIncoming(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void MavRingBuf_Push(MavRingBuf_t *rb, uint8_t byte)
+{
+    uint16_t next = (uint16_t)((rb->head + 1U) % MAV_RX_BUF_SIZE);
+    if (next != rb->tail)
+    {
+        rb->buf[rb->head] = byte;
+        rb->head = next;
+    }
+}
+
+static uint8_t MavRingBuf_Pop(MavRingBuf_t *rb, uint8_t *byte)
+{
+    if (rb->head == rb->tail)
+    {
+        return 0U;
+    }
+    *byte = rb->buf[rb->tail];
+    rb->tail = (uint16_t)((rb->tail + 1U) % MAV_RX_BUF_SIZE);
+    return 1U;
+}
+
+static void MAVLink_SendParamValue(uint16_t idx)
+{
+    if (idx >= PARAM_COUNT)
+    {
+        return;
+    }
+
+    uint16_t len = mavlink_msg_param_value_pack(
+        SYS_ID, COMP_ID_FC, &msg_param,
+        param_table[idx].name,
+        *param_table[idx].val_ptr,
+        MAV_PARAM_TYPE_REAL32,
+        PARAM_COUNT,
+        idx);
+
+    len = (uint16_t)mavlink_msg_to_send_buffer(param_usb_buf, &msg_param);
+
+    /* Kirim via USB CDC (tunggu sebentar jika endpoint USB sedang sibuk) */
+    for (uint8_t retry = 0U; retry < 5U; retry++)
+    {
+        if (CDC_Transmit_FS(param_usb_buf, len) == USBD_OK)
+        {
+            break;
+        }
+        HAL_Delay(1U);
+    }
+
+    /* Kirim juga via Radio Telemetri 915 MHz (USART1) */
+    memcpy(param_uart_buf, param_usb_buf, len);
+    (void)HAL_UART_Transmit(&huart1, param_uart_buf, len, 50U);
+}
+
+static int16_t MAVLink_FindParamByName(const char *param_id)
+{
+    char clean_name[17];
+    memset(clean_name, 0, sizeof(clean_name));
+    memcpy(clean_name, param_id, 16U);
+
+    for (uint16_t i = 0U; i < PARAM_COUNT; i++)
+    {
+        if (strncmp(clean_name, param_table[i].name, 16U) == 0)
+        {
+            return (int16_t)i;
+        }
+    }
+    return -1;
+}
+
+static void MAVLink_HandleMessage(const mavlink_message_t *msg)
+{
+    if (msg->msgid == MAVLINK_MSG_ID_PARAM_REQUEST_LIST)
+    {
+        mavlink_param_request_list_t req;
+        mavlink_msg_param_request_list_decode(msg, &req);
+
+        if ((req.target_system == SYS_ID || req.target_system == 0U) &&
+            (req.target_component == COMP_ID_FC || req.target_component == MAV_COMP_ID_ALL))
+        {
+            param_stream_idx = 0U;
+            param_streaming = 1U;
+            waktu_param_stream = 0U;
+        }
+    }
+    else if (msg->msgid == MAVLINK_MSG_ID_PARAM_REQUEST_READ)
+    {
+        mavlink_param_request_read_t req;
+        mavlink_msg_param_request_read_decode(msg, &req);
+
+        if ((req.target_system == SYS_ID || req.target_system == 0U) &&
+            (req.target_component == COMP_ID_FC || req.target_component == MAV_COMP_ID_ALL))
+        {
+            if (req.param_index >= 0 && (uint16_t)req.param_index < PARAM_COUNT)
+            {
+                MAVLink_SendParamValue((uint16_t)req.param_index);
+            }
+            else
+            {
+                int16_t idx = MAVLink_FindParamByName(req.param_id);
+                if (idx >= 0)
+                {
+                    MAVLink_SendParamValue((uint16_t)idx);
+                }
+            }
+        }
+    }
+    else if (msg->msgid == MAVLINK_MSG_ID_PARAM_SET)
+    {
+        mavlink_param_set_t set;
+        mavlink_msg_param_set_decode(msg, &set);
+
+        if ((set.target_system == SYS_ID || set.target_system == 0U) &&
+            (set.target_component == COMP_ID_FC || set.target_component == MAV_COMP_ID_ALL))
+        {
+            int16_t idx = MAVLink_FindParamByName(set.param_id);
+            if (idx >= 0 && isfinite(set.param_value))
+            {
+                *param_table[idx].val_ptr = set.param_value;
+
+                /* Reset integral jika Ki diubah menjadi 0 */
+                if (pwm.pid_roll.ki == 0.0f)  pwm.pid_roll.integral = 0.0f;
+                if (pwm.pid_pitch.ki == 0.0f) pwm.pid_pitch.integral = 0.0f;
+
+                /* Balas langsung ke Mission Planner sebagai konfirmasi Write Params */
+                MAVLink_SendParamValue((uint16_t)idx);
+            }
+        }
+    }
+}
+
+static void MAVLink_ProcessIncoming(void)
+{
+    uint8_t byte = 0U;
+
+    /* 1. Proses paket MAVLink masuk dari USB Type-C */
+    while (MavRingBuf_Pop(&mav_usb_rx, &byte) != 0U)
+    {
+        if (mavlink_parse_char(MAVLINK_COMM_0, byte, &rx_msg_usb, &rx_status_usb) == MAVLINK_FRAMING_OK)
+        {
+            MAVLink_HandleMessage(&rx_msg_usb);
+        }
+    }
+
+    /* 2. Proses paket MAVLink masuk dari Radio Telemetri 915 MHz (USART1) */
+    while (MavRingBuf_Pop(&mav_uart_rx, &byte) != 0U)
+    {
+        if (mavlink_parse_char(MAVLINK_COMM_1, byte, &rx_msg_uart, &rx_status_uart) == MAVLINK_FRAMING_OK)
+        {
+            MAVLink_HandleMessage(&rx_msg_uart);
+        }
+    }
+
+    /* 3. Kirim daftar parameter satu per satu secara bertahap agar radio tidak penuh */
+    if (param_streaming != 0U)
+    {
+        uint32_t now = HAL_GetTick();
+        if ((now - waktu_param_stream) >= PARAM_STREAM_MS)
+        {
+            waktu_param_stream = now;
+            if (param_stream_idx < PARAM_COUNT)
+            {
+                MAVLink_SendParamValue(param_stream_idx);
+                param_stream_idx++;
+            }
+            else
+            {
+                param_streaming = 0U;
+            }
+        }
+    }
+}
 
 /* Auto-detect alamat BMP280 (0x76 atau 0x77), cek Chip ID, dan baca kalibrasi */
 HAL_StatusTypeDef BMP280_Init(BMP280_t *dev)
@@ -644,8 +870,9 @@ int main(void)
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm.elevator);
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pwm.rudder);
 
-    /* Mulai menerima data SBUS byte-per-byte via interrupt USART2 (PA3) */
+    /* Mulai menerima data SBUS (USART2 PA3) dan perintah MAVLink Radio (USART1 PA10) */
     HAL_UART_Receive_IT(&huart2, &sbus_rx_byte, 1U);
+    HAL_UART_Receive_IT(&huart1, &radio_rx_byte, 1U);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -658,6 +885,9 @@ int main(void)
         {
             mpu.dt = 0.01f;
         }
+
+        /* Proses permintaan / perubahan parameter dari Mission Planner (USB & Radio 915 MHz) */
+        MAVLink_ProcessIncoming();
 
         /* Baca dan filter ketinggian barometer tiap 50 ms (20 Hz) */
         BMP280_UpdateAltitude(&bmp);
@@ -863,7 +1093,7 @@ int main(void)
                 gx_rad, gy_rad, gz_rad);
             total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_att);
 
-            /* 3. GLOBAL_POSITION_INT (Sumber utama HUD Altitude & rel_alt di Mission Planner!) */
+            /* 3. GLOBAL_POSITION_INT (Sumber utama HUD Altitude & rel_alt di Mission Planner) */
             float heading_deg_f = fmodf(mpu.kalmanZ, 360.0f);
             if (heading_deg_f < 0.0f) heading_deg_f += 360.0f;
             int16_t  heading_deg  = (int16_t)heading_deg_f;
@@ -1180,8 +1410,10 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void MAVLink_PushRxBytes(const uint8_t *buf, uint32_t len)
 {
-    (void)buf;
-    (void)len;
+    for (uint32_t i = 0U; i < len; i++)
+    {
+        MavRingBuf_Push(&mav_usb_rx, buf[i]);
+    }
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -1215,6 +1447,24 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
 
         HAL_UART_Receive_IT(&huart2, &sbus_rx_byte, 1U);
+    }
+    else if (huart->Instance == USART1)
+    {
+        MavRingBuf_Push(&mav_uart_rx, radio_rx_byte);
+        HAL_UART_Receive_IT(&huart1, &radio_rx_byte, 1U);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        sbus_idx = 0U;
+        HAL_UART_Receive_IT(&huart2, &sbus_rx_byte, 1U);
+    }
+    else if (huart->Instance == USART1)
+    {
+        HAL_UART_Receive_IT(&huart1, &radio_rx_byte, 1U);
     }
 }
 /* USER CODE END 4 */

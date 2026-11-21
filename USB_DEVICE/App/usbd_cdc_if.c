@@ -128,7 +128,7 @@ static int8_t CDC_Receive_FS(uint8_t* pbuf, uint32_t *Len);
 static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
-
+extern void MAVLink_PushRxBytes(const uint8_t *buf, uint32_t len);
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
 /**
