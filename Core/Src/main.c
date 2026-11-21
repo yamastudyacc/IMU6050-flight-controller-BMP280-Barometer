@@ -64,11 +64,12 @@ typedef struct {
 
 typedef struct {
     uint8_t  addr;
-    uint8_t  sehat;
+    uint8_t  chip_id;
     uint16_t dig_T1, dig_P1;
     int16_t  dig_T2, dig_T3;
     int16_t  dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
 
+    float    suhu_c;
     float    tekanan_pa;
     float    tekanan_hpa;
     float    tekanan_ref_p0;
@@ -76,6 +77,8 @@ typedef struct {
     float    ketinggian_filter;
     float    climb_mps;
     uint32_t waktu_baro;
+    uint32_t read_ok_count;
+    uint32_t read_err_count;
 } BMP280_t;
 
 typedef struct {
@@ -123,14 +126,10 @@ typedef struct {
 #define DEG_TO_RAD        0.01745329252f
 
 #define SYS_ID            1U
-#define COMP_ID_KALMAN    1U
-#define COMP_ID_COMP      2U
+#define COMP_ID_FC        1U
 
-#define BARO_UPDATE_MS    50U          /* Update pembacaan BMP280 tiap 50 ms (20 Hz) */
-#define ATT_TELEM_MS      20U          /* Kirim Attitude ke GCS tiap 20 ms (50 Hz) */
-#define ALT_TELEM_MS      50U          /* Kirim Altitude & VFR_HUD tiap 50 ms (20 Hz) */
-#define EXTRA_TELEM_MS    100U         /* Kirim Servo & Tekanan Baro tiap 100 ms (10 Hz) */
-#define RADIO_TELEM_MS    50U          /* Kirim telemetri radio USART1 tiap 50 ms (20 Hz) */
+#define BARO_UPDATE_MS    50U          /* Update barometer 20 Hz */
+#define TELEM_UPDATE_MS   50U          /* Kirim telemetri MAVLink USB & Radio 20 Hz */
 
 /* Konstanta SBUS & Mode Terbang */
 #define SBUS_FRAME_LEN    25U
@@ -140,6 +139,11 @@ typedef struct {
 #define MODE_MANUAL       0U           /* Kendali penuh stick pilot (tanpa koreksi PID) */
 #define MODE_STABILIZE    1U           /* Auto-level: PID menjaga sudut sesuai arah stick */
 #define MODE_ALTHOLD      2U           /* Altitude Hold: PID menjaga sudut & ketinggian baro */
+
+/* Custom Mode ID standar ArduPlane agar terbaca di HUD Mission Planner */
+#define PLANE_MODE_MANUAL     0U
+#define PLANE_MODE_STABILIZE  2U
+#define PLANE_MODE_FBWA       5U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -191,21 +195,18 @@ PWM_Servo_t pwm = {
 uint32_t waktu_sekarang = 0;
 uint32_t waktu_sebelumnya = 0;
 uint32_t waktu_hb = 0;
-uint32_t waktu_att = 0;
-uint32_t waktu_alt_msg = 0;
-uint32_t waktu_extra = 0;
 uint32_t waktu_led = 0;
-uint32_t waktu_radio = 0;
+uint32_t waktu_telem = 0;
 
-mavlink_message_t msg_kalman;
-mavlink_message_t msg_comp;
 mavlink_message_t msg_hb;
-mavlink_message_t msg_vfr;
+mavlink_message_t msg_att;
 mavlink_message_t msg_gpos;
 mavlink_message_t msg_alt;
-mavlink_message_t msg_press;
+mavlink_message_t msg_vfr;
 mavlink_message_t msg_servo;
-uint8_t tx_buf[MAVLINK_MAX_PACKET_LEN * 8];
+
+uint8_t usb_tx_buf[MAVLINK_MAX_PACKET_LEN * 6];
+uint8_t uart_tx_buf[MAVLINK_MAX_PACKET_LEN * 6];
 
 /* ------------------------------- SBUS RC -------------------------------- */
 uint8_t  sbus_rx_byte = 0U;
@@ -237,14 +238,12 @@ void BMP280_UpdateAltitude(BMP280_t *dev);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Auto-detect alamat BMP280 (0x76 atau 0x77) dan baca koefisien kalibrasi */
+/* Auto-detect alamat BMP280 (0x76 atau 0x77), cek Chip ID, dan baca kalibrasi */
 HAL_StatusTypeDef BMP280_Init(BMP280_t *dev)
 {
     uint8_t calib[24];
-    uint8_t config = 0x10U;     /* IIR filter x16 */
+    uint8_t config = 0x10U;     /* IIR filter x16, standby 0.5 ms */
     uint8_t ctrl_meas = 0x57U;  /* Temp x2, Pressure x16, Normal mode */
-
-    dev->sehat = 0U;
 
     if (HAL_I2C_IsDeviceReady(&hi2c1, BMP280_ADDR_LOW, 3U, 100U) == HAL_OK)
     {
@@ -255,6 +254,18 @@ HAL_StatusTypeDef BMP280_Init(BMP280_t *dev)
         dev->addr = BMP280_ADDR_HIGH;
     }
     else
+    {
+        return HAL_ERROR;
+    }
+
+    if (HAL_I2C_Mem_Read(&hi2c1, dev->addr, 0xD0U,
+                         I2C_MEMADD_SIZE_8BIT, &dev->chip_id, 1U, 100U) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    /* 0x58 = BMP280, 0x60 = BME280 */
+    if ((dev->chip_id != 0x58U) && (dev->chip_id != 0x60U))
     {
         return HAL_ERROR;
     }
@@ -295,7 +306,6 @@ HAL_StatusTypeDef BMP280_Init(BMP280_t *dev)
         return HAL_ERROR;
     }
 
-    dev->sehat = 1U;
     return HAL_OK;
 }
 
@@ -305,14 +315,14 @@ float BMP280_ReadPressure(BMP280_t *dev)
 
     if (dev->addr == 0U)
     {
-        dev->sehat = 0U;
+        dev->read_err_count++;
         return NAN;
     }
 
     if (HAL_I2C_Mem_Read(&hi2c1, dev->addr, 0xF7U,
-                         I2C_MEMADD_SIZE_8BIT, raw, sizeof(raw), 5U) != HAL_OK)
+                         I2C_MEMADD_SIZE_8BIT, raw, sizeof(raw), 15U) != HAL_OK)
     {
-        dev->sehat = 0U;
+        dev->read_err_count++;
         return NAN;
     }
 
@@ -327,6 +337,7 @@ float BMP280_ReadPressure(BMP280_t *dev)
                        ((adc_T >> 4) - (int32_t)dev->dig_T1)) >> 12) *
                     ((int32_t)dev->dig_T3)) >> 14;
     int32_t t_fine = var1 + var2;
+    dev->suhu_c = (float)((t_fine * 5 + 128) >> 8) / 100.0f;
 
     int64_t p_var1 = ((int64_t)t_fine) - 128000;
     int64_t p_var2 = p_var1 * p_var1 * (int64_t)dev->dig_P6;
@@ -338,7 +349,7 @@ float BMP280_ReadPressure(BMP280_t *dev)
 
     if (p_var1 == 0)
     {
-        dev->sehat = 0U;
+        dev->read_err_count++;
         return NAN;
     }
 
@@ -353,11 +364,11 @@ float BMP280_ReadPressure(BMP280_t *dev)
 
     if (!isfinite(dev->tekanan_pa) || dev->tekanan_pa < 30000.0f || dev->tekanan_pa > 120000.0f)
     {
-        dev->sehat = 0U;
+        dev->read_err_count++;
         return NAN;
     }
 
-    dev->sehat = 1U;
+    dev->read_ok_count++;
     return dev->tekanan_pa;
 }
 
@@ -383,6 +394,11 @@ void BMP280_UpdateAltitude(BMP280_t *dev)
     }
 
     float ratio = pressure / dev->tekanan_ref_p0;
+    if (ratio <= 0.1f || ratio >= 2.0f)
+    {
+        return;
+    }
+
     dev->ketinggian_m = 44330.0f * (1.0f - powf(ratio, 0.19029495f));
 
     if (!isfinite(dev->ketinggian_m))
@@ -537,15 +553,9 @@ int main(void)
         Error_Handler();
     }
 
-    /* Tunggu 500 ms dan buang 15 pembacaan awal agar filter IIR x16 BMP280 stabil */
-    HAL_Delay(500U);
-    for (uint8_t i = 0U; i < 15U; i++)
-    {
-        (void)BMP280_ReadPressure(&bmp);
-        HAL_Delay(25U);
-    }
+    HAL_Delay(100U);
 
-    /* Ambil rata-rata 20 sampel valid sebagai P0 (0.0 meter) */
+    /* Ambil rata-rata 20 sampel awal sebagai P0 (0.0 meter) */
     float sum_p0 = 0.0f;
     uint8_t valid_samples = 0U;
     for (uint8_t i = 0U; i < 20U; i++)
@@ -556,7 +566,7 @@ int main(void)
             sum_p0 += p_sample;
             valid_samples++;
         }
-        HAL_Delay(25U);
+        HAL_Delay(20U);
     }
 
     if (valid_samples == 0U)
@@ -572,11 +582,8 @@ int main(void)
     bmp.waktu_baro = HAL_GetTick();
     waktu_sebelumnya = bmp.waktu_baro;
     waktu_hb = bmp.waktu_baro;
-    waktu_att = bmp.waktu_baro;
-    waktu_alt_msg = bmp.waktu_baro;
-    waktu_extra = bmp.waktu_baro;
     waktu_led = bmp.waktu_baro;
-    waktu_radio = bmp.waktu_baro;
+    waktu_telem = bmp.waktu_baro;
 
     /* Aktifkan DLPF ~42 Hz pada register 0x1A MPU6050 untuk meredam getaran motor */
     uint8_t dlpf_cfg = 0x03U;
@@ -621,4 +628,624 @@ int main(void)
 
     if (gyro_samples > 0U)
     {
-        mpu.gyroX_bias = sum_gx / (float)gyro_
+        mpu.gyroX_bias = sum_gx / (float)gyro_samples;
+        mpu.gyroY_bias = sum_gy / (float)gyro_samples;
+        mpu.gyroZ_bias = sum_gz / (float)gyro_samples;
+    }
+
+    /* Mulai sinyal PWM 50 Hz pada PA6, PA7, PB0, PB1 dan set posisi netral 1500 us */
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm.aileron_L);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm.aileron_R);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm.elevator);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pwm.rudder);
+
+    /* Mulai menerima data SBUS byte-per-byte via interrupt USART2 (PA3) */
+    HAL_UART_Receive_IT(&huart2, &sbus_rx_byte, 1U);
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+    while (1)
+    {
+        waktu_sekarang = HAL_GetTick();
+        mpu.dt = (waktu_sekarang - waktu_sebelumnya) / 1000.0f;
+        if (mpu.dt <= 0.001f || mpu.dt > 0.05f)
+        {
+            mpu.dt = 0.01f;
+        }
+
+        /* Baca dan filter ketinggian barometer tiap 50 ms (20 Hz) */
+        BMP280_UpdateAltitude(&bmp);
+
+        /* Baca 14 byte data MPU6050 dengan timeout 5 ms */
+        if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x3BU,
+                             I2C_MEMADD_SIZE_8BIT, mpu.data_mentah, 14U, 5U) == HAL_OK)
+        {
+            mpu.i2c_err_count = 0U;
+            mpu.sensor_failsafe = 0U;
+
+            mpu.accX_raw  = (int16_t)((mpu.data_mentah[0] << 8) | mpu.data_mentah[1]);
+            mpu.accY_raw  = (int16_t)((mpu.data_mentah[2] << 8) | mpu.data_mentah[3]);
+            mpu.accZ_raw  = (int16_t)((mpu.data_mentah[4] << 8) | mpu.data_mentah[5]);
+            mpu.temp_raw  = (int16_t)((mpu.data_mentah[6] << 8) | mpu.data_mentah[7]);
+            mpu.gyroX_raw = (int16_t)((mpu.data_mentah[8] << 8) | mpu.data_mentah[9]);
+            mpu.gyroY_raw = (int16_t)((mpu.data_mentah[10] << 8) | mpu.data_mentah[11]);
+            mpu.gyroZ_raw = (int16_t)((mpu.data_mentah[12] << 8) | mpu.data_mentah[13]);
+
+            mpu.accX_g = mpu.accX_raw / 16384.0f;
+            mpu.accY_g = mpu.accY_raw / 16384.0f;
+            mpu.accZ_g = mpu.accZ_raw / 16384.0f;
+            mpu.suhu_c = (mpu.temp_raw / 340.0f) + 36.53f;
+            mpu.gyroX_dps = (mpu.gyroX_raw / 131.0f) - mpu.gyroX_bias;
+            mpu.gyroY_dps = (mpu.gyroY_raw / 131.0f) - mpu.gyroY_bias;
+            mpu.gyroZ_dps = (mpu.gyroZ_raw / 131.0f) - mpu.gyroZ_bias;
+
+            /* Complementary Filter */
+            mpu.sudut_accX = atan2f(mpu.accY_g, mpu.accZ_g) * RAD_TO_DEG;
+            mpu.sudut_accY = atan2f(-mpu.accX_g, mpu.accZ_g) * RAD_TO_DEG;
+
+            mpu.compX = 0.98f * (mpu.compX + (mpu.gyroX_dps * mpu.dt)) + 0.02f * mpu.sudut_accX;
+            mpu.compY = 0.98f * (mpu.compY + (mpu.gyroY_dps * mpu.dt)) + 0.02f * mpu.sudut_accY;
+            mpu.compZ += mpu.gyroZ_dps * mpu.dt;
+
+            /* Kalman Filter */
+            mpu.kalmanX += mpu.gyroX_dps * mpu.dt;
+            mpu.err_gyroX += mpu.Q_drift;
+
+            mpu.kalmanY += mpu.gyroY_dps * mpu.dt;
+            mpu.err_gyroY += mpu.Q_drift;
+
+            mpu.kalmanZ += mpu.gyroZ_dps * mpu.dt;
+
+            mpu.kalman_gainX = mpu.err_gyroX / (mpu.err_gyroX + mpu.E_acc);
+            mpu.kalmanX += mpu.kalman_gainX * (mpu.sudut_accX - mpu.kalmanX);
+            mpu.err_gyroX = (1.0f - mpu.kalman_gainX) * mpu.err_gyroX;
+
+            mpu.kalman_gainY = mpu.err_gyroY / (mpu.err_gyroY + mpu.E_acc);
+            mpu.kalmanY += mpu.kalman_gainY * (mpu.sudut_accY - mpu.kalmanY);
+            mpu.err_gyroY = (1.0f - mpu.kalman_gainY) * mpu.err_gyroY;
+
+            /* ---------------- BACA MODE TERBANG & SETPOINT SBUS ---------------- */
+            static uint8_t prev_mode = MODE_STABILIZE;
+
+            /* Jika sinyal SBUS hilang > 100 ms atau flag failsafe aktif, paksa Auto-Level datar */
+            if ((waktu_sekarang - sbus_last_frame_ms) > SBUS_TIMEOUT_MS || sbus_failsafe != 0U)
+            {
+                sbus_failsafe = 1U;
+                flight_mode = MODE_STABILIZE;
+                pwm.target_roll = 0.0f;
+                pwm.target_pitch = 0.0f;
+                pwm.enable_alt_hold = 0U;
+            }
+            else
+            {
+                /* CH5 (Sakelar 3-Posisi): <1300 = Manual, 1300..1700 = Stabilize, >1700 = Alt Hold */
+                if (sbus_us[4] < 1300U)
+                {
+                    flight_mode = MODE_MANUAL;
+                    pwm.enable_alt_hold = 0U;
+                }
+                else if (sbus_us[4] < 1700U)
+                {
+                    flight_mode = MODE_STABILIZE;
+                    pwm.enable_alt_hold = 0U;
+                }
+                else
+                {
+                    flight_mode = MODE_ALTHOLD;
+                    pwm.enable_alt_hold = 1U;
+                    /* Kunci ketinggian saat ini sebagai target tepat ketika sakelar masuk Alt Hold */
+                    if (prev_mode != MODE_ALTHOLD)
+                    {
+                        pwm.target_alt = bmp.ketinggian_filter;
+                    }
+                }
+            }
+            prev_mode = flight_mode;
+
+            /* ---------------- HITUNG OUTPUT SERVO BERDASARKAN MODE ---------------- */
+            float out_roll = 0.0f;
+            float out_pitch = 0.0f;
+            float out_yaw = 0.0f;
+
+            if (flight_mode == MODE_MANUAL)
+            {
+                /* Reset integral PID saat mode manual agar tidak menumpuk (anti-windup) */
+                pwm.pid_roll.integral = 0.0f;
+                pwm.pid_pitch.integral = 0.0f;
+
+                /* Teruskan gerakan stick langsung ke servo (-400 .. +400 us) */
+                out_roll  = ((float)sbus_us[0] - 1500.0f) * 0.8f;
+                out_pitch = ((float)sbus_us[1] - 1500.0f) * 0.8f;
+                out_yaw   = ((float)sbus_us[3] - 1500.0f) * 0.8f;
+            }
+            else
+            {
+                /* Deadband stick 15 us di sekitar titik tengah (1500 us) */
+                float stick_roll  = (fabsf((float)sbus_us[0] - 1500.0f) < 15.0f) ? 0.0f : ((float)sbus_us[0] - 1500.0f);
+                float stick_pitch = (fabsf((float)sbus_us[1] - 1500.0f) < 15.0f) ? 0.0f : ((float)sbus_us[1] - 1500.0f);
+                float stick_yaw   = (fabsf((float)sbus_us[3] - 1500.0f) < 15.0f) ? 0.0f : ((float)sbus_us[3] - 1500.0f);
+
+                /* Konversi stick ke sudut target (Roll maks +-35 deg, Pitch maks +-30 deg) */
+                pwm.target_roll = (stick_roll / 500.0f) * 35.0f;
+
+                if (pwm.enable_alt_hold != 0U)
+                {
+                    float err_alt = pwm.target_alt - bmp.ketinggian_filter;
+                    pwm.target_pitch = clamp_f((pwm.kp_alt * err_alt) - (pwm.kd_alt * bmp.climb_mps), -10.0f, 10.0f);
+                }
+                else
+                {
+                    pwm.target_pitch = (stick_pitch / 500.0f) * 30.0f;
+                }
+
+                out_roll  = PID_Compute(&pwm.pid_roll,  pwm.target_roll,  mpu.kalmanX, mpu.gyroX_dps, mpu.dt);
+                out_pitch = PID_Compute(&pwm.pid_pitch, pwm.target_pitch, mpu.kalmanY, mpu.gyroY_dps, mpu.dt);
+                out_yaw   = clamp_f((stick_yaw * 0.7f) - (pwm.kd_yaw * mpu.gyroZ_dps), -350.0f, 350.0f);
+            }
+
+            pwm.aileron_L = (uint16_t)(clamp_f(1500.0f + pwm.trim_roll_L + (pwm.dir_roll_L * out_roll),  1000.0f, 2000.0f) + 0.5f);
+            pwm.aileron_R = (uint16_t)(clamp_f(1500.0f + pwm.trim_roll_R + (pwm.dir_roll_R * out_roll),  1000.0f, 2000.0f) + 0.5f);
+            pwm.elevator  = (uint16_t)(clamp_f(1500.0f + pwm.trim_pitch  + (pwm.dir_pitch  * out_pitch), 1000.0f, 2000.0f) + 0.5f);
+            pwm.rudder    = (uint16_t)(clamp_f(1500.0f + pwm.trim_yaw    + (pwm.dir_yaw    * out_yaw),   1000.0f, 2000.0f) + 0.5f);
+
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm.aileron_L); /* PA6 - Aileron Kiri */
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm.aileron_R); /* PA7 - Aileron Kanan */
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm.elevator);  /* PB0 - Elevator */
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pwm.rudder);    /* PB1 - Rudder (opsional) */
+        }
+        else
+        {
+            /* Failsafe: jika baca I2C gagal 3x berturut-turut, kembalikan servo ke netral */
+            if (mpu.i2c_err_count < 255U)
+            {
+                mpu.i2c_err_count++;
+            }
+            if (mpu.i2c_err_count >= 3U)
+            {
+                mpu.sensor_failsafe = 1U;
+                pwm.pid_roll.integral = 0.0f;
+                pwm.pid_pitch.integral = 0.0f;
+
+                pwm.aileron_L = 1500U;
+                pwm.aileron_R = 1500U;
+                pwm.elevator  = 1500U;
+                pwm.rudder    = 1500U;
+
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 1500U);
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 1500U);
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 1500U);
+                __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 1500U);
+            }
+        }
+
+        /* ---------------- PAKET TELEMETRI MAVLINK V2 (20 Hz) ---------------- */
+        if ((waktu_sekarang - waktu_telem) >= TELEM_UPDATE_MS)
+        {
+            waktu_telem = waktu_sekarang;
+            uint16_t total_len = 0U;
+
+            /* 1. HEARTBEAT (1 Hz) dengan identitas ArduPlane agar HUD Mission Planner aktif */
+            if ((waktu_sekarang - waktu_hb) >= 1000U)
+            {
+                waktu_hb = waktu_sekarang;
+                uint32_t custom_mode = PLANE_MODE_STABILIZE;
+                if (flight_mode == MODE_MANUAL)
+                {
+                    custom_mode = PLANE_MODE_MANUAL;
+                }
+                else if (flight_mode == MODE_ALTHOLD)
+                {
+                    custom_mode = PLANE_MODE_FBWA;
+                }
+
+                mavlink_msg_heartbeat_pack(
+                    SYS_ID, COMP_ID_FC, &msg_hb,
+                    MAV_TYPE_FIXED_WING, MAV_AUTOPILOT_ARDUPILOTMEGA,
+                    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | MAV_MODE_FLAG_SAFETY_ARMED,
+                    custom_mode, MAV_STATE_ACTIVE);
+                total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_hb);
+            }
+
+            /* 2. ATTITUDE (Roll, Pitch, Yaw) */
+            float gx_rad = mpu.gyroX_dps * DEG_TO_RAD;
+            float gy_rad = mpu.gyroY_dps * DEG_TO_RAD;
+            float gz_rad = mpu.gyroZ_dps * DEG_TO_RAD;
+
+            mavlink_msg_attitude_pack(
+                SYS_ID, COMP_ID_FC, &msg_att, waktu_sekarang,
+                mpu.kalmanX * DEG_TO_RAD, mpu.kalmanY * DEG_TO_RAD, mpu.kalmanZ * DEG_TO_RAD,
+                gx_rad, gy_rad, gz_rad);
+            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_att);
+
+            /* 3. GLOBAL_POSITION_INT (Sumber utama HUD Altitude & rel_alt di Mission Planner!) */
+            float heading_deg_f = fmodf(mpu.kalmanZ, 360.0f);
+            if (heading_deg_f < 0.0f) heading_deg_f += 360.0f;
+            int16_t  heading_deg  = (int16_t)heading_deg_f;
+            uint16_t heading_cdeg = (uint16_t)(heading_deg_f * 100.0f);
+
+            int32_t alt_mm = (int32_t)(bmp.ketinggian_filter * 1000.0f);
+            int16_t vz_cms = (int16_t)(-bmp.climb_mps * 100.0f); /* NED: positif ke bawah */
+
+            mavlink_msg_global_position_int_pack(
+                SYS_ID, COMP_ID_FC, &msg_gpos, waktu_sekarang,
+                0, 0, alt_mm, alt_mm,
+                0, 0, vz_cms, heading_cdeg);
+            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_gpos);
+
+            /* 4. ALTITUDE (#141 - Mendukung pembacaan barometer & ketinggian relatif GCS modern) */
+            mavlink_msg_altitude_pack(
+                SYS_ID, COMP_ID_FC, &msg_alt,
+                (uint64_t)waktu_sekarang * 1000ULL,
+                bmp.ketinggian_filter,
+                bmp.ketinggian_filter,
+                bmp.ketinggian_filter,
+                bmp.ketinggian_filter,
+                bmp.ketinggian_filter,
+                bmp.ketinggian_filter);
+            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_alt);
+
+            /* 5. VFR_HUD (Climb rate, heading, dan fallback altitude) */
+            mavlink_msg_vfr_hud_pack(
+                SYS_ID, COMP_ID_FC, &msg_vfr,
+                0.0f, 0.0f, heading_deg, 0U,
+                bmp.ketinggian_filter, bmp.climb_mps);
+            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_vfr);
+
+            /* 6. SERVO_OUTPUT_RAW (Pulsa PWM 1000 - 2000 us) */
+            mavlink_msg_servo_output_raw_pack(
+                SYS_ID, COMP_ID_FC, &msg_servo,
+                waktu_sekarang * 1000U, 0U,
+                pwm.aileron_L, pwm.aileron_R, pwm.elevator, pwm.rudder,
+                0U, 0U, 0U, 0U,
+                0U, 0U, 0U, 0U,
+                0U, 0U, 0U, 0U);
+            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_servo);
+
+            if (total_len > 0U)
+            {
+                /* Kirim ke PC via USB CDC */
+                (void)CDC_Transmit_FS(usb_tx_buf, total_len);
+
+                /* Salin ke buffer khusus UART1 agar tidak bertabrakan dengan DMA USB */
+                memcpy(uart_tx_buf, usb_tx_buf, total_len);
+                (void)HAL_UART_Transmit(&huart1, uart_tx_buf, total_len, 50U);
+            }
+        }
+
+        /* Kedipkan LED PC13 setiap 250 ms sebagai tanda sistem berjalan normal */
+        if ((waktu_sekarang - waktu_led) >= 250U)
+        {
+            waktu_led = waktu_sekarang;
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        }
+
+        HAL_Delay(10U);
+        waktu_sebelumnya = waktu_sekarang;
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 15;
+  RCC_OscInitStruct.PLL.PLLN = 144;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 5;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 15;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 19999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.Pulse = 0;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.Pulse = 1500;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 57600;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 100000;
+  huart2.Init.WordLength = UART_WORDLENGTH_9B;
+  huart2.Init.StopBits = UART_STOPBITS_2;
+  huart2.Init.Parity = UART_PARITY_EVEN;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+void MAVLink_PushRxBytes(const uint8_t *buf, uint32_t len)
+{
+    (void)buf;
+    (void)len;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        uint32_t now = HAL_GetTick();
+
+        /* Jika jeda antar-byte > 3 ms, berarti paket baru dimulai dari byte ke-0 */
+        if ((now - sbus_last_byte_ms) > 3U)
+        {
+            sbus_idx = 0U;
+        }
+        sbus_last_byte_ms = now;
+
+        if (sbus_idx == 0U)
+        {
+            if (sbus_rx_byte == SBUS_HEADER)
+            {
+                sbus_buf[sbus_idx++] = sbus_rx_byte;
+            }
+        }
+        else
+        {
+            sbus_buf[sbus_idx++] = sbus_rx_byte;
+            if (sbus_idx >= SBUS_FRAME_LEN)
+            {
+                SBUS_ParseFrame(sbus_buf);
+                sbus_idx = 0U;
+            }
+        }
+
+        HAL_UART_Receive_IT(&huart2, &sbus_rx_byte, 1U);
+    }
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
