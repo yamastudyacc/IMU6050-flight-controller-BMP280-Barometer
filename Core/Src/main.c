@@ -2,9 +2,13 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Anti-Jitter Fixed-Wing Flight Controller
-  *                   Manual + Stabilize + Auto (AltHold) + Gimbal Jitter Filter
-  *                   + Median-3 SBUS/CRSF + MAVLink v2 Telemetry
+  * @brief          : Final Fixed-Wing Flight Controller (100 Hz Deterministic)
+  *                   - Default PID Stabilize + Auto (AltHold) + Manual Backup
+  *                   - Signed RC Frame Age + Seqlock Atomic Snapshot (No IRQ Lock)
+  *                   - Low-Lag PID + Backlash Servo Hysteresis (Smooth Sweep)
+  *                   - Whole-Packet Non-Blocking MAVLink Telemetry (40 ms step)
+  *                   - MPU6050 Fault/Freeze Detection + 9-Pulse SCL I2C1 Recovery
+  *                   - Independent Watchdog (IWDG) Fail-Safe Boot
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -28,6 +32,12 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct {
+    float z1;
+    float z2;
+    uint8_t initialized;
+} BiquadLPF_t;
+
 typedef struct {
     uint8_t identitas;
     uint8_t ready;
@@ -69,7 +79,7 @@ typedef struct {
 } BMP280_t;
 
 typedef struct {
-    /* Gain PID Attitude & Altitude (dapat diubah langsung lewat Mission Planner) */
+    /* Gain PID Attitude & Altitude (dapat diatur live di Mission Planner) */
     float kp_roll;
     float ki_roll;
     float kd_roll;
@@ -126,6 +136,13 @@ typedef struct {
     volatile uint16_t head;
     volatile uint16_t tail;
 } MavRingBuf_t;
+
+#define UART_TX_BUF_SIZE 512U
+typedef struct {
+    uint8_t buf[UART_TX_BUF_SIZE];
+    uint16_t head;
+    uint16_t tail;
+} UartTxRingBuf_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -134,16 +151,23 @@ typedef struct {
 #define BMP280_ADDR_LOW       (0x76U << 1)
 #define BMP280_ADDR_HIGH      (0x77U << 1)
 
+/* Pin I2C1 untuk pemulihan bus 9-pulsa SCL jika SDA tertahan LOW */
+#define I2C1_SCL_PORT         GPIOB
+#define I2C1_SCL_PIN          GPIO_PIN_6
+#define I2C1_SDA_PORT         GPIOB
+#define I2C1_SDA_PIN          GPIO_PIN_7
+
 #define RAD_TO_DEG            57.295779513f
 #define DEG_TO_RAD            0.01745329252f
 
 #define SYS_ID                1U
 #define COMP_ID_FC            1U
 
+#define CTRL_LOOP_MS          10U          /* Loop PID tetap 100 Hz (10.0 ms) */
 #define BARO_UPDATE_MS        50U          /* Update barometer 20 Hz */
-#define TELEM_UPDATE_MS       50U          /* Kirim telemetri MAVLink USB & Radio 20 Hz */
+#define TELEM_STEP_MS         40U          /* 1 paket MAVLink tiap 40 ms (~1,3 KB/s) agar link 57600 tidak jenuh */
 #define PARAM_STREAM_MS       20U          /* Jeda kirim parameter ke Mission Planner */
-#define RC_DIAG_MS            2000U        /* Kirim status mode & remote setiap 2 detik */
+#define RC_DIAG_MS            2000U        /* Kirim status PID & sensor setiap 2 detik */
 
 /* Konstanta Receiver (Inverted SBUS, Uninverted SBUS, & CRSF) */
 #define RC_PROTO_SBUS_INV     0U           /* Inverted SBUS 100k baud */
@@ -157,10 +181,18 @@ typedef struct {
 #define CRSF_MAX_FRAME_LEN    64U
 #define CRSF_FRAMETYPE_RC     0x16U
 
-#define RC_HOLD_TIMEOUT_MS    300U         /* Tahan posisi servo terakhir 300 ms saat paket drop */
-#define STICK_DEADBAND_US     18.0f        /* Redam jitter potensiometer stick di titik tengah */
-#define SERVO_DEADBAND_US     4            /* Abaikan perubahan <= 4 us agar servo diam total */
+#define RC_HOLD_TIMEOUT_MS    300U         /* Tahan posisi terakhir 300 ms saat paket drop */
+#define STICK_DEADBAND_US     20.0f        /* Redam jitter potensiometer stick di titik tengah */
+#define PID_OUT_SMOOTH        0.50f        /* EMA output PID (lag ~14 ms, responsif & halus) */
+#define SERVO_SLEW_MAX_US     50.0f        /* STABILIZE/AUTO: maks 50 us per 10 ms (5000 us/s) */
+#define SERVO_SLEW_MANUAL_US  1000.0f      /* MANUAL: tanpa batas slew (rentang penuh = 1000 us) */
+#define SERVO_HYST_US         5            /* STABILIZE/AUTO: jendela backlash +-5 us */
+#define SERVO_HYST_MANUAL_US  2            /* MANUAL: hysteresis kecil agar tetap tidak mendengung */
 #define MAV_RC_TIMEOUT_MS     800U
+
+#define MPU_FAIL_LIMIT        10U          /* 10 siklus (100 ms) gagal/beku -> fault */
+#define MPU_OK_RECOVER        50U          /* 50 siklus (0,5 s) sehat berturut-turut -> fault dilepas */
+#define MPU_RECOVER_RETRY_MS  1000U        /* Jeda antar percobaan pulihkan I2C/MPU */
 
 /* ArduPlane Custom Mode IDs */
 #define PLANE_MODE_MANUAL     0U
@@ -182,13 +214,26 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+IWDG_HandleTypeDef hiwdg;   /* di blok USER CODE agar tidak hilang saat regenerate CubeMX */
+
 MPU6050_t mpu = {
     .dt        = 0.01f,
     .err_gyroX = 1.0f,
     .err_gyroY = 1.0f,
-    .Q_drift   = 0.003f,
-    .E_acc     = 2.0f
+    .Q_drift   = 0.001f,
+    .E_acc     = 12.0f
 };
+
+BiquadLPF_t gyro_lpf_x = {0};
+BiquadLPF_t gyro_lpf_y = {0};
+BiquadLPF_t gyro_lpf_z = {0};
+
+uint8_t  mpu_fault           = 0U;
+uint8_t  mpu_fail_count      = 0U;
+uint8_t  mpu_ok_count        = 0U;
+uint8_t  mpu_frozen_count    = 0U;
+uint8_t  mpu_prev_raw[14]    = {0};
+uint32_t mpu_last_recover_ms = 0U;
 
 BMP280_t bmp = {
     .tekanan_pa     = 101325.0f,
@@ -196,13 +241,13 @@ BMP280_t bmp = {
 };
 
 AutoPID_t pid = {
-    .kp_roll      = 5.5f,
-    .ki_roll      = 0.6f,
-    .kd_roll      = 0.35f,
-    .kp_pitch     = 6.0f,
-    .ki_pitch     = 0.6f,
-    .kd_pitch     = 0.35f,
-    .kp_yaw       = 0.45f,
+    .kp_roll      = 6.0f,
+    .ki_roll      = 0.65f,
+    .kd_roll      = 0.30f,
+    .kp_pitch     = 6.5f,
+    .ki_pitch     = 0.65f,
+    .kd_pitch     = 0.30f,
+    .kp_yaw       = 0.40f,
     .kp_alt       = 2.0f,
     .ki_alt       = 0.20f,
     .target_alt_m = 0.0f
@@ -244,8 +289,9 @@ MavParamItem_t param_table[] = {
 };
 #define PARAM_COUNT ((uint16_t)(sizeof(param_table) / sizeof(param_table[0])))
 
-uint8_t  flight_mode        = PLANE_MODE_MANUAL;
-uint8_t  prev_flight_mode   = PLANE_MODE_MANUAL;
+/* Default langsung ke STABILIZE agar PID langsung aktif saat menyala */
+uint8_t  flight_mode        = PLANE_MODE_STABILIZE;
+uint8_t  prev_flight_mode   = PLANE_MODE_STABILIZE;
 uint16_t ch5_last_us        = 1000U;
 uint8_t  ch5_initialized    = 0U;
 
@@ -253,35 +299,29 @@ float    filt_stick_roll_us  = 0.0f;
 float    filt_stick_pitch_us = 0.0f;
 float    filt_stick_yaw_us   = 0.0f;
 
+float    servo_slew_ail_L    = 1500.0f;
+float    servo_slew_ail_R    = 1500.0f;
+float    servo_slew_ele      = 1500.0f;
+float    servo_slew_rud      = 1500.0f;
+
 uint8_t  param_streaming    = 0U;
 uint16_t param_stream_idx   = 0U;
 uint32_t waktu_param_stream = 0U;
 
 /* ------------------------------- MAVLink -------------------------------- */
-uint32_t waktu_sekarang = 0U;
-uint32_t waktu_sebelumnya = 0U;
-uint32_t waktu_hb = 0U;
-uint32_t waktu_led = 0U;
-uint32_t waktu_telem = 0U;
+uint32_t waktu_ctrl    = 0U;
+uint32_t waktu_hb      = 0U;
+uint32_t waktu_led     = 0U;
+uint32_t waktu_telem   = 0U;
 uint32_t waktu_rc_diag = 0U;
+uint8_t  telem_slot    = 0U;
 
-mavlink_message_t msg_hb;
-mavlink_message_t msg_att;
-mavlink_message_t msg_gpos;
-mavlink_message_t msg_vfr;
-mavlink_message_t msg_servo;
-mavlink_message_t msg_rc;
-mavlink_message_t msg_param;
-mavlink_message_t msg_ack;
-mavlink_message_t msg_statustext;
+mavlink_message_t msg_tx;
+uint8_t pkt_buf[MAVLINK_MAX_PACKET_LEN];
 
-uint8_t usb_tx_buf[MAVLINK_MAX_PACKET_LEN * 8];
-uint8_t uart_tx_buf[MAVLINK_MAX_PACKET_LEN * 8];
-uint8_t ctrl_usb_buf[MAVLINK_MAX_PACKET_LEN];
-uint8_t ctrl_uart_buf[MAVLINK_MAX_PACKET_LEN];
-
-MavRingBuf_t mav_usb_rx  = { .head = 0U, .tail = 0U };
-MavRingBuf_t mav_uart_rx = { .head = 0U, .tail = 0U };
+MavRingBuf_t    mav_usb_rx  = { .head = 0U, .tail = 0U };
+MavRingBuf_t    mav_uart_rx = { .head = 0U, .tail = 0U };
+UartTxRingBuf_t uart1_tx_rb = { .head = 0U, .tail = 0U };
 uint8_t radio_rx_byte = 0U;
 
 mavlink_message_t rx_msg_usb;
@@ -318,7 +358,7 @@ volatile uint16_t sbus_us[16] = {
     1500U, 1500U, 1000U, 1500U, 1000U, 1500U, 1500U, 1500U,
     1500U, 1500U, 1500U, 1500U, 1500U, 1500U, 1500U, 1500U
 };
-uint16_t sbus_hist[16][3];
+uint16_t sbus_hist[16][5];
 uint8_t  rc_first_frame_done  = 0U;
 
 uint16_t mav_rc_us[16]      = {
@@ -367,40 +407,92 @@ static uint16_t clamp_u16(uint16_t val, uint16_t min_v, uint16_t max_v)
     return val;
 }
 
-static float apply_deadband_f(float val, float db)
+/* Filter Biquad Butterworth Orde-2 (fc = 15 Hz pada Fs = 100 Hz) */
+static float biquad15Hz_Update(BiquadLPF_t *f, float input)
 {
-    if (val > db)  return val - db;
-    if (val < -db) return val + db;
-    return 0.0f;
+    const float b0 =  0.1311064f;
+    const float b1 =  0.2622129f;
+    const float b2 =  0.1311064f;
+    const float a1 = -0.7477892f;
+    const float a2 =  0.2722149f;
+
+    if (f->initialized == 0U)
+    {
+        f->z1 = input * (1.0f - b0);
+        f->z2 = input * (b2 - a2);
+        f->initialized = 1U;
+        return input;
+    }
+
+    float out = (b0 * input) + f->z1;
+    f->z1 = (b1 * input) - (a1 * out) + f->z2;
+    f->z2 = (b2 * input) - (a2 * out);
+    return out;
+}
+
+/* Kurva Deadband Kubik Halus (C1-smooth): mencegah osilasi bolak-balik di tepi deadband */
+static float smooth_deadband_f(float val, float db, float blend)
+{
+    float abs_v = fabsf(val);
+    if (abs_v <= db)
+    {
+        return 0.0f;
+    }
+
+    float excess = abs_v - db;
+    float shaped = excess;
+    if (blend > 0.001f && excess < blend)
+    {
+        float u = excess / blend;
+        shaped = excess * u * (2.0f - u);
+    }
+
+    return (val >= 0.0f) ? shaped : -shaped;
+}
+
+static float slew_limit_f(float current, float target, float max_step)
+{
+    float diff = target - current;
+    if (diff > max_step)  return current + max_step;
+    if (diff < -max_step) return current - max_step;
+    return target;
 }
 
 static float shape_stick_us(uint16_t raw_us, float deadband_us)
 {
     float delta = (float)raw_us - 1500.0f;
-    if (delta > deadband_us)
-    {
-        return ((delta - deadband_us) * 500.0f) / (500.0f - deadband_us);
-    }
-    if (delta < -deadband_us)
-    {
-        return ((delta + deadband_us) * 500.0f) / (500.0f - deadband_us);
-    }
-    return 0.0f;
+    float shaped = smooth_deadband_f(delta, deadband_us, 35.0f);
+    return clamp_f((shaped * 500.0f) / (500.0f - deadband_us), -500.0f, 500.0f);
 }
 
-static uint16_t apply_deadband_u16(uint16_t prev_val, uint16_t new_val, int32_t db)
+/* Hysteresis tipe backlash: diam selama target masih dalam +-hyst dari output, tetapi begitu
+   target keluar dari jendela itu, output MENGIKUTI (tertinggal sebesar hyst), bukan melompat. */
+static uint16_t apply_hyst_u16(uint16_t prev_val, uint16_t new_val, int32_t hyst)
 {
-    int32_t diff = (int32_t)new_val - (int32_t)prev_val;
-    if (diff < 0) diff = -diff;
-    return (diff <= db) ? prev_val : new_val;
+    int32_t p = (int32_t)prev_val;
+    int32_t n = (int32_t)new_val;
+
+    if (n <= 1000 || n >= 2000) return new_val;   /* ujung langkah: capai batas penuh */
+    if (n > (p + hyst)) return (uint16_t)(n - hyst);
+    if (n < (p - hyst)) return (uint16_t)(n + hyst);
+    return prev_val;
 }
 
-static uint16_t median3_u16(uint16_t a, uint16_t b, uint16_t c)
+static uint16_t median5_u16(uint16_t a, uint16_t b, uint16_t c, uint16_t d, uint16_t e)
 {
-    if (a > b) { uint16_t t = a; a = b; b = t; }
-    if (b > c) { uint16_t t = b; b = c; c = t; }
-    if (a > b) { uint16_t t = a; a = b; b = t; }
-    return b;
+    uint16_t v[5] = { a, b, c, d, e };
+    for (uint8_t i = 1U; i < 5U; i++)
+    {
+        uint16_t key = v[i];
+        int8_t j = (int8_t)i - 1;
+        while (j >= 0 && v[j] > key)
+        {
+            v[j + 1] = v[j];
+            j--;
+        }
+        v[j + 1] = key;
+    }
+    return v[2];
 }
 
 static uint16_t norm1000_to_us(int16_t val)
@@ -442,6 +534,33 @@ static uint8_t MavRingBuf_Pop(MavRingBuf_t *rb, uint8_t *byte)
     return 1U;
 }
 
+static void Uart1Tx_Enqueue(const uint8_t *data, uint16_t len)
+{
+    uint16_t used       = (uint16_t)((uart1_tx_rb.head + UART_TX_BUF_SIZE - uart1_tx_rb.tail) % UART_TX_BUF_SIZE);
+    uint16_t free_bytes = (uint16_t)(UART_TX_BUF_SIZE - 1U - used);
+
+    if (len > free_bytes)
+    {
+        return; /* Buang SATU paket utuh; jangan sisakan paket terpotong di stream */
+    }
+
+    for (uint16_t i = 0U; i < len; i++)
+    {
+        uart1_tx_rb.buf[uart1_tx_rb.head] = data[i];
+        uart1_tx_rb.head = (uint16_t)((uart1_tx_rb.head + 1U) % UART_TX_BUF_SIZE);
+    }
+}
+
+static void Uart1Tx_ServiceNonBlocking(void)
+{
+    while (uart1_tx_rb.head != uart1_tx_rb.tail &&
+           (huart1.Instance->SR & USART_SR_TXE) != 0U)
+    {
+        huart1.Instance->DR = uart1_tx_rb.buf[uart1_tx_rb.tail];
+        uart1_tx_rb.tail = (uint16_t)((uart1_tx_rb.tail + 1U) % UART_TX_BUF_SIZE);
+    }
+}
+
 static uint16_t RC_ToMicroseconds(uint16_t val)
 {
     if (val <= 172U) return 1000U;
@@ -469,7 +588,7 @@ static void RC_Unpack16Channels(const uint8_t *p, uint16_t ch[16])
     ch[15] = (uint16_t)(((p[20]>> 5)| (p[21] << 3)) & 0x07FFU);
 }
 
-/* Filter Median 3-Sampel: menolak lonjakan 1-frame dari SBUS/CRSF */
+/* Filter Median 5-Sampel: menolak gangguan/jitter hingga 2 frame berturut-turut */
 static void RC_CommitFilteredChannels(const uint16_t raw_ch[16])
 {
     for (uint8_t i = 0U; i < 16U; i++)
@@ -478,18 +597,24 @@ static void RC_CommitFilteredChannels(const uint16_t raw_ch[16])
 
         if (rc_first_frame_done == 0U)
         {
-            sbus_hist[i][0] = new_us;
-            sbus_hist[i][1] = new_us;
-            sbus_hist[i][2] = new_us;
-            sbus_us[i]      = new_us;
+            for (uint8_t k = 0U; k < 5U; k++)
+            {
+                sbus_hist[i][k] = new_us;
+            }
+            sbus_us[i] = new_us;
         }
         else
         {
             sbus_hist[i][0] = sbus_hist[i][1];
             sbus_hist[i][1] = sbus_hist[i][2];
-            sbus_hist[i][2] = new_us;
+            sbus_hist[i][2] = sbus_hist[i][3];
+            sbus_hist[i][3] = sbus_hist[i][4];
+            sbus_hist[i][4] = new_us;
 
-            uint16_t med_us = median3_u16(sbus_hist[i][0], sbus_hist[i][1], sbus_hist[i][2]);
+            uint16_t med_us = median5_u16(
+                sbus_hist[i][0], sbus_hist[i][1], sbus_hist[i][2],
+                sbus_hist[i][3], sbus_hist[i][4]);
+
             int32_t spike = (int32_t)new_us - (int32_t)med_us;
             if (spike < 0) spike = -spike;
             if (spike > 20)
@@ -501,6 +626,31 @@ static void RC_CommitFilteredChannels(const uint16_t raw_ch[16])
         }
     }
     rc_first_frame_done = 1U;
+}
+
+/* Seqlock: ganjil = penulis sedang menulis, genap = data konsisten tanpa matikan IRQ */
+static volatile uint32_t rc_seq = 0U;
+#define RC_SeqBegin() do { rc_seq++; __DMB(); } while (0)
+#define RC_SeqEnd()   do { __DMB(); rc_seq++; } while (0)
+
+static void RC_GetAtomicSnapshot(uint16_t dst[16], uint32_t *last_ms_out)
+{
+    uint32_t s1, s2;
+    uint8_t tries = 0U;
+
+    do
+    {
+        s1 = rc_seq;
+        __DMB();
+        for (uint8_t i = 0U; i < 16U; i++)
+        {
+            dst[i] = sbus_us[i];
+        }
+        *last_ms_out = rc_last_frame_ms;
+        __DMB();
+        s2 = rc_seq;
+        tries++;
+    } while (((s1 != s2) || ((s1 & 1U) != 0U)) && (tries < 4U));
 }
 
 static uint8_t CRSF_Crc8(const uint8_t *ptr, uint8_t len)
@@ -541,12 +691,14 @@ static void SBUS_ParseFrame(const uint8_t *buf)
     }
 
     RC_Unpack16Channels(&buf[1], sbus_ch);
-    RC_CommitFilteredChannels(sbus_ch);
 
+    RC_SeqBegin();
+    RC_CommitFilteredChannels(sbus_ch);
     sbus_failsafe = 0U;
     rc_proto_locked = 1U;
     rc_valid_frames++;
     rc_last_frame_ms = HAL_GetTick();
+    RC_SeqEnd();
 }
 
 static void CRSF_ParseFrame(const uint8_t *buf, uint8_t total_len)
@@ -565,13 +717,18 @@ static void CRSF_ParseFrame(const uint8_t *buf, uint8_t total_len)
 
     rc_proto_locked = 1U;
     rc_valid_frames++;
-    rc_last_frame_ms = HAL_GetTick();
 
     if (buf[2] == CRSF_FRAMETYPE_RC && payload_plus_type_len >= 24U)
     {
         RC_Unpack16Channels(&buf[3], sbus_ch);
+
+        RC_SeqBegin();
         RC_CommitFilteredChannels(sbus_ch);
         sbus_failsafe = 0U;
+        /* Hanya frame kanal RC yang memperpanjang hold; frame LinkStats/telemetri
+           tidak boleh membuat stick lama dianggap masih segar. */
+        rc_last_frame_ms = HAL_GetTick();
+        RC_SeqEnd();
     }
 }
 
@@ -716,7 +873,7 @@ static void RC_SetProtocol(uint8_t proto)
     }
 }
 
-static void UART_PollFallbackIfNoIrq(void)
+static void UART_ServiceBackground(void)
 {
     if (rc_protocol_mode != RC_PROTO_SBUS_INV && usart2_irq_available == 0U)
     {
@@ -748,49 +905,16 @@ static void UART_PollFallbackIfNoIrq(void)
             MavRingBuf_Push(&mav_uart_rx, b1);
         }
     }
+
+    Uart1Tx_ServiceNonBlocking();
 }
 
-static void UART1_TransmitNonBlockingRC(const uint8_t *data, uint16_t len)
+static void MAVLink_SendPacketNonBlocking(const mavlink_message_t *msg)
 {
-    for (uint16_t i = 0U; i < len; i++)
-    {
-        uint32_t t0 = HAL_GetTick();
-        while ((huart1.Instance->SR & USART_SR_TXE) == 0U)
-        {
-            UART_PollFallbackIfNoIrq();
-            if ((HAL_GetTick() - t0) > 5U)
-            {
-                return;
-            }
-        }
-        huart1.Instance->DR = data[i];
-        UART_PollFallbackIfNoIrq();
-    }
-}
-
-static void DelayAndPollUart(uint32_t wait_ms)
-{
-    uint32_t start = HAL_GetTick();
-    while ((HAL_GetTick() - start) < wait_ms)
-    {
-        UART_PollFallbackIfNoIrq();
-    }
-}
-
-static void MAVLink_SendDirect(const mavlink_message_t *msg)
-{
-    uint16_t len = (uint16_t)mavlink_msg_to_send_buffer(ctrl_usb_buf, msg);
-
-    for (uint8_t retry = 0U; retry < 2U; retry++)
-    {
-        if (CDC_Transmit_FS(ctrl_usb_buf, len) == USBD_OK)
-        {
-            break;
-        }
-    }
-
-    memcpy(ctrl_uart_buf, ctrl_usb_buf, len);
-    UART1_TransmitNonBlockingRC(ctrl_uart_buf, len);
+    uint16_t len = (uint16_t)mavlink_msg_to_send_buffer(pkt_buf, msg);
+    (void)CDC_Transmit_FS(pkt_buf, len);
+    Uart1Tx_Enqueue(pkt_buf, len);
+    Uart1Tx_ServiceNonBlocking();
 }
 
 static void MAVLink_SendStatusText(uint8_t severity, const char *fmt_msg)
@@ -800,10 +924,10 @@ static void MAVLink_SendStatusText(uint8_t severity, const char *fmt_msg)
     strncpy(text_buf, fmt_msg, sizeof(text_buf) - 1U);
 
     (void)mavlink_msg_statustext_pack(
-        SYS_ID, COMP_ID_FC, &msg_statustext,
+        SYS_ID, COMP_ID_FC, &msg_tx,
         severity, text_buf, 0U, 0U);
 
-    MAVLink_SendDirect(&msg_statustext);
+    MAVLink_SendPacketNonBlocking(&msg_tx);
 }
 
 static void MAVLink_SendParamValue(uint16_t idx)
@@ -814,23 +938,23 @@ static void MAVLink_SendParamValue(uint16_t idx)
     }
 
     (void)mavlink_msg_param_value_pack(
-        SYS_ID, COMP_ID_FC, &msg_param,
+        SYS_ID, COMP_ID_FC, &msg_tx,
         param_table[idx].name,
         *param_table[idx].val_ptr,
         MAV_PARAM_TYPE_REAL32,
         PARAM_COUNT,
         idx);
 
-    MAVLink_SendDirect(&msg_param);
+    MAVLink_SendPacketNonBlocking(&msg_tx);
 }
 
 static void MAVLink_SendCommandAck(uint16_t command, uint8_t result)
 {
     (void)mavlink_msg_command_ack_pack(
-        SYS_ID, COMP_ID_FC, &msg_ack,
+        SYS_ID, COMP_ID_FC, &msg_tx,
         command, result, 0U, 0, 0U, 0U);
 
-    MAVLink_SendDirect(&msg_ack);
+    MAVLink_SendPacketNonBlocking(&msg_tx);
 }
 
 static int16_t MAVLink_FindParamByName(const char *param_id)
@@ -1220,6 +1344,141 @@ void BMP280_UpdateAltitude(BMP280_t *dev)
         altitude_previous = dev->ketinggian_filter;
     }
 }
+
+static void I2C1_Delay5us(void)
+{
+    uint32_t ticks = SystemCoreClock / 200000U; /* ~5 us (100 kHz half-period) */
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U)
+    {
+        uint32_t start = DWT->CYCCNT;
+        while ((DWT->CYCCNT - start) < ticks) { }
+    }
+    else
+    {
+        for (volatile uint32_t i = 0U; i < (ticks / 4U); i++) { }
+    }
+}
+
+/* Lepas bus I2C1 yang macet (SDA tertahan LOW) dengan hingga 9 pulsa SCL (PB6) + STOP */
+static void I2C1_RecoverBus(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    (void)HAL_I2C_DeInit(&hi2c1);
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Mode Open-Drain + Pull-Up agar tidak bentrok jika slave masih menarik jalur LOW */
+    HAL_GPIO_WritePin(I2C1_SCL_PORT, I2C1_SCL_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(I2C1_SDA_PORT, I2C1_SDA_PIN, GPIO_PIN_SET);
+
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull  = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+
+    GPIO_InitStruct.Pin = I2C1_SCL_PIN;
+    HAL_GPIO_Init(I2C1_SCL_PORT, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = I2C1_SDA_PIN;
+    HAL_GPIO_Init(I2C1_SDA_PORT, &GPIO_InitStruct);
+
+    I2C1_Delay5us();
+
+    /* Kirim hingga 9 pulsa clock sampai slave melepas SDA (HIGH) */
+    for (uint8_t i = 0U; i < 9U; i++)
+    {
+        if (HAL_GPIO_ReadPin(I2C1_SDA_PORT, I2C1_SDA_PIN) == GPIO_PIN_SET)
+        {
+            break;
+        }
+        HAL_GPIO_WritePin(I2C1_SCL_PORT, I2C1_SCL_PIN, GPIO_PIN_RESET);
+        I2C1_Delay5us();
+        HAL_GPIO_WritePin(I2C1_SCL_PORT, I2C1_SCL_PIN, GPIO_PIN_SET);
+        I2C1_Delay5us();
+    }
+
+    /* Bangkitkan kondisi STOP (SCL LOW -> SDA LOW -> SCL HIGH -> SDA HIGH) */
+    HAL_GPIO_WritePin(I2C1_SCL_PORT, I2C1_SCL_PIN, GPIO_PIN_RESET);
+    I2C1_Delay5us();
+    HAL_GPIO_WritePin(I2C1_SDA_PORT, I2C1_SDA_PIN, GPIO_PIN_RESET);
+    I2C1_Delay5us();
+    HAL_GPIO_WritePin(I2C1_SCL_PORT, I2C1_SCL_PIN, GPIO_PIN_SET);
+    I2C1_Delay5us();
+    HAL_GPIO_WritePin(I2C1_SDA_PORT, I2C1_SDA_PIN, GPIO_PIN_SET);
+    I2C1_Delay5us();
+
+    /* Kembalikan pin PB6/PB7 ke fungsi alternatif hardware I2C1 */
+    (void)HAL_I2C_Init(&hi2c1);
+}
+
+static HAL_StatusTypeDef MPU_Configure(void)
+{
+    uint8_t wake = 0x00U;   /* PWR_MGMT_1: bangunkan sensor */
+    uint8_t fs   = 0x00U;   /* Accel & gyro full-scale default */
+    uint8_t dlpf = 0x04U;   /* DLPF 20 Hz, sama seperti init awal */
+
+    if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x6BU, I2C_MEMADD_SIZE_8BIT, &wake, 1U, 5U) != HAL_OK) return HAL_ERROR;
+    if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x1CU, I2C_MEMADD_SIZE_8BIT, &fs,   1U, 5U) != HAL_OK) return HAL_ERROR;
+    if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x1BU, I2C_MEMADD_SIZE_8BIT, &fs,   1U, 5U) != HAL_OK) return HAL_ERROR;
+    if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x1AU, I2C_MEMADD_SIZE_8BIT, &dlpf, 1U, 5U) != HAL_OK) return HAL_ERROR;
+    return HAL_OK;
+}
+
+/* Baca MPU + cek kesehatan. Return 1 jika data layak dipakai siklus ini. */
+static uint8_t MPU_ReadChecked(void)
+{
+    if (mpu.ready == 0U)
+    {
+        return 0U;
+    }
+
+    uint8_t good = 0U;
+
+    if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x3BU,
+                         I2C_MEMADD_SIZE_8BIT, mpu.data_mentah, 14U, 5U) == HAL_OK)
+    {
+        /* 14 byte identik berturut-turut = sensor tidur/beku walau I2C "sukses" */
+        if (memcmp(mpu.data_mentah, mpu_prev_raw, 14U) == 0)
+        {
+            if (mpu_frozen_count < 255U) mpu_frozen_count++;
+        }
+        else
+        {
+            mpu_frozen_count = 0U;
+        }
+        memcpy(mpu_prev_raw, mpu.data_mentah, 14U);
+        good = (mpu_frozen_count < MPU_FAIL_LIMIT) ? 1U : 0U;
+    }
+
+    if (good != 0U)
+    {
+        mpu_fail_count = 0U;
+        if (mpu_ok_count < 255U) mpu_ok_count++;
+        if ((mpu_fault != 0U) && (mpu_ok_count >= MPU_OK_RECOVER))
+        {
+            mpu_fault = 0U;   /* Mode TIDAK otomatis kembali: pilot harus geser CH5 */
+        }
+    }
+    else
+    {
+        mpu_ok_count = 0U;
+        if (mpu_fail_count < 255U) mpu_fail_count++;
+
+        if (mpu_fail_count >= MPU_FAIL_LIMIT)
+        {
+            uint32_t t = HAL_GetTick();
+            if ((mpu_fault == 0U) || ((t - mpu_last_recover_ms) >= MPU_RECOVER_RETRY_MS))
+            {
+                mpu_fault = 1U;
+                mpu_last_recover_ms = t;
+                I2C1_RecoverBus();
+                (void)MPU_Configure();
+            }
+        }
+    }
+
+    return good;
+}
 /* USER CODE END 0 */
 
 /**
@@ -1257,6 +1516,15 @@ int main(void)
   MX_TIM3_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+    /* Jika reset berasal dari watchdog (mis. saat terbang), mulai dalam keadaan fault:
+       paksa MANUAL sampai MPU sehat 0,5 s dan pilot menggeser CH5. Bias gyro hasil
+       kalibrasi saat bergerak tidak bisa dipercaya penuh. */
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET)
+    {
+        mpu_fault = 1U;
+    }
+    __HAL_RCC_CLEAR_RESET_FLAGS();
+
     HAL_NVIC_SetPriority(SysTick_IRQn, 2U, 0U);
     HAL_NVIC_SetPriority(OTG_FS_IRQn, 3U, 0U);
     HAL_NVIC_SetPriority(USART1_IRQn, 2U, 0U);
@@ -1266,6 +1534,10 @@ int main(void)
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
     usart2_irq_available = (NVIC_GetEnableIRQ(USART2_IRQn) != 0U) ? 1U : 0U;
+
+    /* Aktifkan OC Preload pada TIM3 CH1-CH4 agar pulsa PWM tidak pernah terpotong */
+    SET_BIT(htim3.Instance->CCMR1, TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE);
+    SET_BIT(htim3.Instance->CCMR2, TIM_CCMR2_OC3PE | TIM_CCMR2_OC4PE);
 
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
@@ -1279,13 +1551,16 @@ int main(void)
 
     HAL_Delay(300U);
 
-    /* -------- Inisialisasi MPU6050 + Kalibrasi Gyro Bias -------- */
+    /* Bersihkan bus I2C1 saat boot (antisipasi reset IWDG terjadi di tengah transaksi I2C) */
+    I2C1_RecoverBus();
+
+    /* -------- Inisialisasi MPU6050 (Original & Clone) + Kalibrasi Gyro -------- */
     if (HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x75U,
                          I2C_MEMADD_SIZE_8BIT, &mpu.identitas, 1U, 50U) == HAL_OK &&
-        ((mpu.identitas == 0x68U) || (mpu.identitas == 0x72U)))
+        (mpu.identitas != 0x00U) && (mpu.identitas != 0xFFU))
     {
         uint8_t data_konfig = 0x00U;
-        uint8_t dlpf_cfg    = 0x03U; /* Hardware DLPF 44 Hz untuk meredam getaran mekanis */
+        uint8_t dlpf_cfg    = 0x04U; /* Hardware DLPF 20 Hz untuk meredam getaran mekanis */
         if (HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x6BU, I2C_MEMADD_SIZE_8BIT, &data_konfig, 1U, 50U) == HAL_OK &&
             HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x1CU, I2C_MEMADD_SIZE_8BIT, &data_konfig, 1U, 50U) == HAL_OK &&
             HAL_I2C_Mem_Write(&hi2c1, MPU_ADDR, 0x1BU, I2C_MEMADD_SIZE_8BIT, &data_konfig, 1U, 50U) == HAL_OK &&
@@ -1354,13 +1629,14 @@ int main(void)
         }
     }
 
-    bmp.waktu_baro = HAL_GetTick();
-    waktu_sebelumnya = bmp.waktu_baro;
-    waktu_hb = bmp.waktu_baro;
-    waktu_led = bmp.waktu_baro;
-    waktu_telem = bmp.waktu_baro;
-    waktu_rc_diag = bmp.waktu_baro;
-    rc_last_switch_ms = bmp.waktu_baro;
+    uint32_t boot_ms  = HAL_GetTick();
+    bmp.waktu_baro    = boot_ms;
+    waktu_ctrl        = boot_ms;
+    waktu_hb          = boot_ms;
+    waktu_led         = boot_ms;
+    waktu_telem       = boot_ms;
+    waktu_rc_diag     = boot_ms;
+    rc_last_switch_ms = boot_ms;
 
     RC_SetProtocol(RC_PROTO_SBUS_INV);
 
@@ -1371,387 +1647,463 @@ int main(void)
     {
         (void)HAL_UART_Receive_IT(&huart1, &radio_rx_byte, 1U);
     }
+
+    /* Aktifkan Independent Watchdog (~250 ms nominal) */
+    hiwdg.Instance       = IWDG;
+    hiwdg.Init.Prescaler = IWDG_PRESCALER_16;
+    hiwdg.Init.Reload    = 500U;
+    if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+    {
+        Error_Handler();
+    }
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
     while (1)
     {
-        waktu_sekarang = HAL_GetTick();
-        mpu.dt = (waktu_sekarang - waktu_sebelumnya) / 1000.0f;
-        if (mpu.dt <= 0.001f || mpu.dt > 0.05f)
-        {
-            mpu.dt = 0.01f;
-        }
-
-        UART_PollFallbackIfNoIrq();
+        /* Layanan latar belakang non-blocking (UART TX/RX + MAVLink masuk) */
+        UART_ServiceBackground();
         MAVLink_ProcessIncoming();
-        BMP280_UpdateAltitude(&bmp);
 
-        /* 1. Baca & Filter MPU6050 */
-        if (mpu.ready != 0U &&
-            HAL_I2C_Mem_Read(&hi2c1, MPU_ADDR, 0x3BU,
-                             I2C_MEMADD_SIZE_8BIT, mpu.data_mentah, 14U, 5U) == HAL_OK)
+        uint32_t now = HAL_GetTick();
+
+        /* Loop Kendali & Sensor Deterministik Tepat 100 Hz (10.0 ms) */
+        if ((now - waktu_ctrl) >= CTRL_LOOP_MS)
         {
-            mpu.accX_raw  = (int16_t)((mpu.data_mentah[0] << 8) | mpu.data_mentah[1]);
-            mpu.accY_raw  = (int16_t)((mpu.data_mentah[2] << 8) | mpu.data_mentah[3]);
-            mpu.accZ_raw  = (int16_t)((mpu.data_mentah[4] << 8) | mpu.data_mentah[5]);
-            mpu.gyroX_raw = (int16_t)((mpu.data_mentah[8] << 8) | mpu.data_mentah[9]);
-            mpu.gyroY_raw = (int16_t)((mpu.data_mentah[10] << 8) | mpu.data_mentah[11]);
-            mpu.gyroZ_raw = (int16_t)((mpu.data_mentah[12] << 8) | mpu.data_mentah[13]);
-
-            mpu.accX_g = mpu.accX_raw / 16384.0f;
-            mpu.accY_g = mpu.accY_raw / 16384.0f;
-            mpu.accZ_g = mpu.accZ_raw / 16384.0f;
-            mpu.gyroX_dps = (mpu.gyroX_raw / 131.0f) - mpu.gyroX_bias;
-            mpu.gyroY_dps = (mpu.gyroY_raw / 131.0f) - mpu.gyroY_bias;
-            mpu.gyroZ_dps = (mpu.gyroZ_raw / 131.0f) - mpu.gyroZ_bias;
-
-            mpu.gyroX_filt += 0.20f * (mpu.gyroX_dps - mpu.gyroX_filt);
-            mpu.gyroY_filt += 0.20f * (mpu.gyroY_dps - mpu.gyroY_filt);
-            mpu.gyroZ_filt += 0.20f * (mpu.gyroZ_dps - mpu.gyroZ_filt);
-
-            mpu.sudut_accX = atan2f(mpu.accY_g, mpu.accZ_g) * RAD_TO_DEG;
-            mpu.sudut_accY = atan2f(-mpu.accX_g, mpu.accZ_g) * RAD_TO_DEG;
-
-            mpu.kalmanX += mpu.gyroX_dps * mpu.dt;
-            mpu.err_gyroX += mpu.Q_drift;
-            mpu.kalman_gainX = mpu.err_gyroX / (mpu.err_gyroX + mpu.E_acc);
-            mpu.kalmanX += mpu.kalman_gainX * (mpu.sudut_accX - mpu.kalmanX);
-            mpu.err_gyroX = (1.0f - mpu.kalman_gainX) * mpu.err_gyroX;
-
-            mpu.kalmanY += mpu.gyroY_dps * mpu.dt;
-            mpu.err_gyroY += mpu.Q_drift;
-            mpu.kalman_gainY = mpu.err_gyroY / (mpu.err_gyroY + mpu.E_acc);
-            mpu.kalmanY += mpu.kalman_gainY * (mpu.sudut_accY - mpu.kalmanY);
-            mpu.err_gyroY = (1.0f - mpu.kalman_gainY) * mpu.err_gyroY;
-
-            mpu.kalmanZ += mpu.gyroZ_dps * mpu.dt;
-
-            mpu.roll_filt  += 0.25f * (mpu.kalmanX - mpu.roll_filt);
-            mpu.pitch_filt += 0.25f * (mpu.kalmanY - mpu.pitch_filt);
-        }
-
-        /* 2. Last-Value Hold 300 ms + Pencarian Protokol Remote */
-        uint8_t rc_hold_active = (rc_last_frame_ms != 0U &&
-                                  (waktu_sekarang - rc_last_frame_ms) <= RC_HOLD_TIMEOUT_MS) ? 1U : 0U;
-
-        if (rc_hold_active == 0U && rc_proto_locked == 0U)
-        {
-            if ((waktu_sekarang - rc_last_switch_ms) >= RC_PROTO_SWITCH_MS)
+            if ((now - waktu_ctrl) > 50U)
             {
-                rc_last_switch_ms = waktu_sekarang;
-                uint8_t next_proto = (uint8_t)((rc_protocol_mode + 1U) % RC_PROTO_COUNT);
-                RC_SetProtocol(next_proto);
+                waktu_ctrl = now;
             }
-        }
-        else
-        {
-            rc_last_switch_ms = waktu_sekarang;
-        }
-
-        static const uint16_t default_rc_us[16] = {
-            1500U, 1500U, 1000U, 1500U, 1000U, 1500U, 1500U, 1500U,
-            1500U, 1500U, 1500U, 1500U, 1500U, 1500U, 1500U, 1500U
-        };
-
-        uint8_t mav_rc_ok = (mav_rc_active_mask != 0U &&
-                             (waktu_sekarang - mav_rc_last_ms) <= MAV_RC_TIMEOUT_MS) ? 1U : 0U;
-
-        if (mav_rc_ok == 0U)
-        {
-            mav_rc_active_mask = 0U;
-        }
-
-        for (uint8_t i = 0U; i < 16U; i++)
-        {
-            uint16_t ch_val = sbus_us[i];
-            active_rc_us[i] = (rc_hold_active != 0U) ? ch_val : default_rc_us[i];
-
-            if (mav_rc_ok != 0U && ((mav_rc_active_mask & (uint16_t)(1U << i)) != 0U))
+            else
             {
-                active_rc_us[i] = mav_rc_us[i];
+                waktu_ctrl += CTRL_LOOP_MS;
             }
-        }
+            mpu.dt = 0.01f;
 
-        /* Haluskan input stick & terapkan deadband tengah 18 us untuk meredam jitter potensiometer */
-        float raw_roll_cmd  = shape_stick_us(active_rc_us[0], STICK_DEADBAND_US);
-        float raw_pitch_cmd = shape_stick_us(active_rc_us[1], STICK_DEADBAND_US);
-        float raw_yaw_cmd   = shape_stick_us(active_rc_us[3], STICK_DEADBAND_US);
+            BMP280_UpdateAltitude(&bmp);
 
-        filt_stick_roll_us  += 0.45f * (raw_roll_cmd  - filt_stick_roll_us);
-        filt_stick_pitch_us += 0.45f * (raw_pitch_cmd - filt_stick_pitch_us);
-        filt_stick_yaw_us   += 0.45f * (raw_yaw_cmd   - filt_stick_yaw_us);
+            /* 1. Baca & Filter Biquad Orde-2 MPU6050 dengan Deteksi Fault/Freeze */
+            if (MPU_ReadChecked() != 0U)
+            {
+                mpu.accX_raw  = (int16_t)((mpu.data_mentah[0] << 8) | mpu.data_mentah[1]);
+                mpu.accY_raw  = (int16_t)((mpu.data_mentah[2] << 8) | mpu.data_mentah[3]);
+                mpu.accZ_raw  = (int16_t)((mpu.data_mentah[4] << 8) | mpu.data_mentah[5]);
+                mpu.gyroX_raw = (int16_t)((mpu.data_mentah[8] << 8) | mpu.data_mentah[9]);
+                mpu.gyroY_raw = (int16_t)((mpu.data_mentah[10] << 8) | mpu.data_mentah[11]);
+                mpu.gyroZ_raw = (int16_t)((mpu.data_mentah[12] << 8) | mpu.data_mentah[13]);
 
-        if (fabsf(filt_stick_roll_us)  < 2.0f) filt_stick_roll_us  = 0.0f;
-        if (fabsf(filt_stick_pitch_us) < 2.0f) filt_stick_pitch_us = 0.0f;
-        if (fabsf(filt_stick_yaw_us)   < 2.0f) filt_stick_yaw_us   = 0.0f;
+                mpu.accX_g = mpu.accX_raw / 16384.0f;
+                mpu.accY_g = mpu.accY_raw / 16384.0f;
+                mpu.accZ_g = mpu.accZ_raw / 16384.0f;
+                mpu.gyroX_dps = (mpu.gyroX_raw / 131.0f) - mpu.gyroX_bias;
+                mpu.gyroY_dps = (mpu.gyroY_raw / 131.0f) - mpu.gyroY_bias;
+                mpu.gyroZ_dps = (mpu.gyroZ_raw / 131.0f) - mpu.gyroZ_bias;
 
-        /* 3. Pemilihan Mode dengan Hysteresis +-25 us pada CH5 */
-        uint16_t ch5 = active_rc_us[4];
-        int32_t ch5_delta = (int32_t)ch5 - (int32_t)ch5_last_us;
-        if (ch5_delta < 0) ch5_delta = -ch5_delta;
+                /* Filter Biquad 15 Hz pada laju gyro untuk memotong getaran frekuensi tinggi */
+                mpu.gyroX_filt = biquad15Hz_Update(&gyro_lpf_x, mpu.gyroX_dps);
+                mpu.gyroY_filt = biquad15Hz_Update(&gyro_lpf_y, mpu.gyroY_dps);
+                mpu.gyroZ_filt = biquad15Hz_Update(&gyro_lpf_z, mpu.gyroZ_dps);
 
-        if (ch5_initialized == 0U || ch5_delta > 35)
-        {
-            ch5_initialized = 1U;
-            ch5_last_us = ch5;
+                mpu.kalmanX += mpu.gyroX_filt * mpu.dt;
+                mpu.kalmanY += mpu.gyroY_filt * mpu.dt;
+                mpu.kalmanZ += mpu.gyroZ_filt * mpu.dt;
+
+                /* G-Force Gate: koreksi accelerometer hanya saat bebas getaran (0.85g - 1.15g) */
+                float acc_mag = sqrtf((mpu.accX_g * mpu.accX_g) +
+                                      (mpu.accY_g * mpu.accY_g) +
+                                      (mpu.accZ_g * mpu.accZ_g));
+                if (acc_mag >= 0.85f && acc_mag <= 1.15f)
+                {
+                    mpu.sudut_accX = atan2f(mpu.accY_g, mpu.accZ_g) * RAD_TO_DEG;
+                    mpu.sudut_accY = atan2f(-mpu.accX_g, mpu.accZ_g) * RAD_TO_DEG;
+
+                    mpu.err_gyroX += mpu.Q_drift;
+                    mpu.kalman_gainX = mpu.err_gyroX / (mpu.err_gyroX + mpu.E_acc);
+                    mpu.kalmanX += mpu.kalman_gainX * (mpu.sudut_accX - mpu.kalmanX);
+                    mpu.err_gyroX = (1.0f - mpu.kalman_gainX) * mpu.err_gyroX;
+
+                    mpu.err_gyroY += mpu.Q_drift;
+                    mpu.kalman_gainY = mpu.err_gyroY / (mpu.err_gyroY + mpu.E_acc);
+                    mpu.kalmanY += mpu.kalman_gainY * (mpu.sudut_accY - mpu.kalmanY);
+                    mpu.err_gyroY = (1.0f - mpu.kalman_gainY) * mpu.err_gyroY;
+                }
+
+                /* Sudut dari Kalman sudah halus (gyro sudah difilter biquad);
+                   filter sudut tambahan hanya menambah lag di dalam loop PID. */
+                mpu.roll_filt  = mpu.kalmanX;
+                mpu.pitch_filt = mpu.kalmanY;
+            }
+
+            /* 2. Ambil Snapshot Seqlock Kanal RC + Last-Value Hold 300 ms */
+            uint16_t snap_rc_us[16];
+            uint32_t snap_frame_ms = 0U;
+            RC_GetAtomicSnapshot(snap_rc_us, &snap_frame_ms);
+
+            /* Umur frame bertanda: frame yang masuk SETELAH 'now' diambil (umur negatif)
+               tetap dianggap segar, bukan underflow jadi angka raksasa. */
+            int32_t rc_age = (int32_t)(now - snap_frame_ms);
+            uint8_t rc_hold_active = (snap_frame_ms != 0U &&
+                                      rc_age <= (int32_t)RC_HOLD_TIMEOUT_MS) ? 1U : 0U;
+
+            if (rc_hold_active == 0U && rc_proto_locked == 0U)
+            {
+                if ((now - rc_last_switch_ms) >= RC_PROTO_SWITCH_MS)
+                {
+                    rc_last_switch_ms = now;
+                    uint8_t next_proto = (uint8_t)((rc_protocol_mode + 1U) % RC_PROTO_COUNT);
+                    RC_SetProtocol(next_proto);
+                }
+            }
+            else
+            {
+                rc_last_switch_ms = now;
+            }
+
+            static const uint16_t default_rc_us[16] = {
+                1500U, 1500U, 1000U, 1500U, 1000U, 1500U, 1500U, 1500U,
+                1500U, 1500U, 1500U, 1500U, 1500U, 1500U, 1500U, 1500U
+            };
+
+            uint8_t mav_rc_ok = (mav_rc_active_mask != 0U &&
+                                 (now - mav_rc_last_ms) <= MAV_RC_TIMEOUT_MS) ? 1U : 0U;
+
+            if (mav_rc_ok == 0U)
+            {
+                mav_rc_active_mask = 0U;
+            }
+
+            for (uint8_t i = 0U; i < 16U; i++)
+            {
+                active_rc_us[i] = (rc_hold_active != 0U) ? snap_rc_us[i] : default_rc_us[i];
+
+                if (mav_rc_ok != 0U && ((mav_rc_active_mask & (uint16_t)(1U << i)) != 0U))
+                {
+                    active_rc_us[i] = mav_rc_us[i];
+                }
+            }
+
+            float raw_roll_cmd  = shape_stick_us(active_rc_us[0], STICK_DEADBAND_US);
+            float raw_pitch_cmd = shape_stick_us(active_rc_us[1], STICK_DEADBAND_US);
+            float raw_yaw_cmd   = shape_stick_us(active_rc_us[3], STICK_DEADBAND_US);
+
+            filt_stick_roll_us  += 0.45f * (raw_roll_cmd  - filt_stick_roll_us);
+            filt_stick_pitch_us += 0.45f * (raw_pitch_cmd - filt_stick_pitch_us);
+            filt_stick_yaw_us   += 0.45f * (raw_yaw_cmd   - filt_stick_yaw_us);
+
+            if (fabsf(filt_stick_roll_us)  < 2.0f) filt_stick_roll_us  = 0.0f;
+            if (fabsf(filt_stick_pitch_us) < 2.0f) filt_stick_pitch_us = 0.0f;
+            if (fabsf(filt_stick_yaw_us)   < 2.0f) filt_stick_yaw_us   = 0.0f;
+
+            /* 3. Pemilihan Mode pada CH5 dengan Hysteresis:
+                  < 1250 = STABILIZE (PID Aktif Default)
+                  1300 - 1700 = AUTO (PID + AltHold)
+                  > 1750 = MANUAL (Cadangan) */
+            uint16_t ch5 = active_rc_us[4];
+            int32_t ch5_delta = (int32_t)ch5 - (int32_t)ch5_last_us;
+            if (ch5_delta < 0) ch5_delta = -ch5_delta;
+
+            if (ch5_initialized == 0U || ch5_delta > 40)
+            {
+                ch5_initialized = 1U;
+                ch5_last_us = ch5;
+
+                if (flight_mode == PLANE_MODE_STABILIZE)
+                {
+                    if (ch5 > 1750U)
+                    {
+                        flight_mode = PLANE_MODE_MANUAL;
+                    }
+                    else if (ch5 > 1300U)
+                    {
+                        flight_mode = PLANE_MODE_AUTO;
+                    }
+                }
+                else if (flight_mode == PLANE_MODE_AUTO)
+                {
+                    if (ch5 < 1250U)
+                    {
+                        flight_mode = PLANE_MODE_STABILIZE;
+                    }
+                    else if (ch5 > 1750U)
+                    {
+                        flight_mode = PLANE_MODE_MANUAL;
+                    }
+                }
+                else /* PLANE_MODE_MANUAL */
+                {
+                    if (ch5 < 1250U)
+                    {
+                        flight_mode = PLANE_MODE_STABILIZE;
+                    }
+                    else if (ch5 < 1700U)
+                    {
+                        flight_mode = PLANE_MODE_AUTO;
+                    }
+                }
+            }
+
+            if ((mpu.ready == 0U) || (mpu_fault != 0U))
+            {
+                flight_mode = PLANE_MODE_MANUAL;
+            }
+
+            if (flight_mode != prev_flight_mode)
+            {
+                AutoPID_Reset(bmp.ketinggian_filter, filt_stick_roll_us, filt_stick_pitch_us, filt_stick_yaw_us);
+                prev_flight_mode = flight_mode;
+            }
+
+            /* 4. Perhitungan Kendali PID (STABILIZE / AUTO) vs MANUAL */
+            float out_roll_us  = 0.0f;
+            float out_pitch_us = 0.0f;
+            float out_yaw_us   = 0.0f;
 
             if (flight_mode == PLANE_MODE_MANUAL)
             {
-                if (ch5 > 1725U)
-                {
-                    flight_mode = PLANE_MODE_AUTO;
-                }
-                else if (ch5 > 1325U)
-                {
-                    flight_mode = PLANE_MODE_STABILIZE;
-                }
+                out_roll_us  = filt_stick_roll_us;
+                out_pitch_us = filt_stick_pitch_us;
+                out_yaw_us   = filt_stick_yaw_us;
             }
-            else if (flight_mode == PLANE_MODE_STABILIZE)
+            else
             {
-                if (ch5 < 1275U)
+                float stick_roll  = filt_stick_roll_us  / 500.0f;
+                float stick_pitch = filt_stick_pitch_us / 500.0f;
+                float stick_yaw   = filt_stick_yaw_us   / 500.0f;
+
+                float target_roll_deg  = stick_roll  * 45.0f;
+                float target_pitch_deg = stick_pitch * 30.0f;
+
+                if (flight_mode == PLANE_MODE_AUTO && bmp.ready != 0U)
                 {
-                    flight_mode = PLANE_MODE_MANUAL;
-                }
-                else if (ch5 > 1725U)
-                {
-                    flight_mode = PLANE_MODE_AUTO;
-                }
-            }
-            else /* PLANE_MODE_AUTO */
-            {
-                if (ch5 < 1275U)
-                {
-                    flight_mode = PLANE_MODE_MANUAL;
-                }
-                else if (ch5 < 1675U)
-                {
-                    flight_mode = PLANE_MODE_STABILIZE;
-                }
-            }
-        }
-
-        if (mpu.ready == 0U)
-        {
-            flight_mode = PLANE_MODE_MANUAL;
-        }
-
-        if (flight_mode != prev_flight_mode)
-        {
-            AutoPID_Reset(bmp.ketinggian_filter, filt_stick_roll_us, filt_stick_pitch_us, filt_stick_yaw_us);
-            prev_flight_mode = flight_mode;
-        }
-
-        /* 4. Perhitungan Kendali Servo (MANUAL vs STABILIZE vs AUTO) */
-        float out_roll_us  = 0.0f;
-        float out_pitch_us = 0.0f;
-        float out_yaw_us   = 0.0f;
-
-        if (flight_mode == PLANE_MODE_MANUAL)
-        {
-            out_roll_us  = filt_stick_roll_us;
-            out_pitch_us = filt_stick_pitch_us;
-            out_yaw_us   = filt_stick_yaw_us;
-        }
-        else
-        {
-            float stick_roll  = filt_stick_roll_us  / 500.0f;
-            float stick_pitch = filt_stick_pitch_us / 500.0f;
-            float stick_yaw   = filt_stick_yaw_us   / 500.0f;
-
-            float target_roll_deg  = stick_roll  * 45.0f;
-            float target_pitch_deg = stick_pitch * 30.0f;
-
-            if (flight_mode == PLANE_MODE_AUTO && bmp.ready != 0U)
-            {
-                if (fabsf(stick_pitch) < 0.05f)
-                {
-                    float alt_err = apply_deadband_f(pid.target_alt_m - bmp.ketinggian_filter, 0.30f);
-                    if (active_rc_us[2] > 1150U && fabsf(alt_err) > 0.0f)
+                    if (fabsf(stick_pitch) < 0.05f)
                     {
-                        pid.i_alt = clamp_f(pid.i_alt + (pid.ki_alt * alt_err * mpu.dt), -8.0f, 8.0f);
+                        float alt_err = smooth_deadband_f(pid.target_alt_m - bmp.ketinggian_filter, 0.30f, 0.50f);
+                        if (active_rc_us[2] > 1150U && fabsf(alt_err) > 0.0f)
+                        {
+                            pid.i_alt = clamp_f(pid.i_alt + (pid.ki_alt * alt_err * mpu.dt), -8.0f, 8.0f);
+                        }
+                        else if (active_rc_us[2] <= 1150U)
+                        {
+                            pid.i_alt = 0.0f;
+                        }
+                        float alt_pitch_cmd = clamp_f((pid.kp_alt * alt_err) + pid.i_alt, -15.0f, 15.0f);
+                        target_pitch_deg += alt_pitch_cmd;
                     }
-                    else if (active_rc_us[2] <= 1150U)
+                    else
                     {
+                        pid.target_alt_m = bmp.ketinggian_filter;
                         pid.i_alt = 0.0f;
                     }
-                    float alt_pitch_cmd = clamp_f((pid.kp_alt * alt_err) + pid.i_alt, -15.0f, 15.0f);
-                    target_pitch_deg += alt_pitch_cmd;
+                }
+
+                /* Kurva deadband kubik halus pada sudut & gyro agar bebas osilasi di meja */
+                float err_roll  = smooth_deadband_f(target_roll_deg  - mpu.roll_filt,  1.8f, 3.0f);
+                float err_pitch = smooth_deadband_f(target_pitch_deg - mpu.pitch_filt, 1.8f, 3.0f);
+
+                float gx_clean = smooth_deadband_f(mpu.gyroX_filt, 1.2f, 2.5f);
+                float gy_clean = smooth_deadband_f(mpu.gyroY_filt, 1.2f, 2.5f);
+                float gz_clean = smooth_deadband_f(mpu.gyroZ_filt, 1.2f, 2.5f);
+
+                if (active_rc_us[2] > 1150U)
+                {
+                    if (fabsf(err_roll) > 0.0f)
+                    {
+                        pid.i_roll = clamp_f(pid.i_roll + (pid.ki_roll * err_roll * mpu.dt), -120.0f, 120.0f);
+                    }
+                    if (fabsf(err_pitch) > 0.0f)
+                    {
+                        pid.i_pitch = clamp_f(pid.i_pitch + (pid.ki_pitch * err_pitch * mpu.dt), -120.0f, 120.0f);
+                    }
                 }
                 else
                 {
-                    pid.target_alt_m = bmp.ketinggian_filter;
-                    pid.i_alt = 0.0f;
+                    pid.i_roll  = 0.0f;
+                    pid.i_pitch = 0.0f;
                 }
+
+                float raw_pid_roll  = (pid.kp_roll  * err_roll)  + pid.i_roll  - (pid.kd_roll  * gx_clean);
+                float raw_pid_pitch = (pid.kp_pitch * err_pitch) + pid.i_pitch - (pid.kd_pitch * gy_clean);
+                float raw_pid_yaw   = (stick_yaw * 500.0f) - (pid.kp_yaw * gz_clean);
+
+                raw_pid_roll  = clamp_f(raw_pid_roll,  -500.0f, 500.0f);
+                raw_pid_pitch = clamp_f(raw_pid_pitch, -500.0f, 500.0f);
+                raw_pid_yaw   = clamp_f(raw_pid_yaw,   -500.0f, 500.0f);
+
+                pid.smooth_roll_us  += PID_OUT_SMOOTH * (raw_pid_roll  - pid.smooth_roll_us);
+                pid.smooth_pitch_us += PID_OUT_SMOOTH * (raw_pid_pitch - pid.smooth_pitch_us);
+                pid.smooth_yaw_us   += PID_OUT_SMOOTH * (raw_pid_yaw   - pid.smooth_yaw_us);
+
+                out_roll_us  = pid.smooth_roll_us;
+                out_pitch_us = pid.smooth_pitch_us;
+                out_yaw_us   = pid.smooth_yaw_us;
             }
 
-            /* Deadband sudut 2.5 derajat agar servo diam total saat pesawat diam di meja */
-            float err_roll  = apply_deadband_f(target_roll_deg  - mpu.roll_filt,  2.5f);
-            float err_pitch = apply_deadband_f(target_pitch_deg - mpu.pitch_filt, 2.5f);
+            /* 5. Slew-Rate Limiter + Backlash Hysteresis PWM ke 4 Servo (bypass di MANUAL) */
+            float desire_ail_L = clamp_f(1500.0f + pwm.trim_roll_L + (pwm.dir_roll_L * out_roll_us),  1000.0f, 2000.0f);
+            float desire_ail_R = clamp_f(1500.0f + pwm.trim_roll_R + (pwm.dir_roll_R * out_roll_us),  1000.0f, 2000.0f);
+            float desire_ele   = clamp_f(1500.0f + pwm.trim_pitch  + (pwm.dir_pitch  * out_pitch_us), 1000.0f, 2000.0f);
+            float desire_rud   = clamp_f(1500.0f + pwm.trim_yaw    + (pwm.dir_yaw    * out_yaw_us),   1000.0f, 2000.0f);
 
-            if (active_rc_us[2] > 1150U)
+            const uint8_t is_manual = (flight_mode == PLANE_MODE_MANUAL) ? 1U : 0U;
+            const float   slew_lim  = (is_manual != 0U) ? SERVO_SLEW_MANUAL_US : SERVO_SLEW_MAX_US;
+            const int32_t hyst_us   = (is_manual != 0U) ? SERVO_HYST_MANUAL_US : SERVO_HYST_US;
+
+            servo_slew_ail_L = slew_limit_f(servo_slew_ail_L, desire_ail_L, slew_lim);
+            servo_slew_ail_R = slew_limit_f(servo_slew_ail_R, desire_ail_R, slew_lim);
+            servo_slew_ele   = slew_limit_f(servo_slew_ele,   desire_ele,   slew_lim);
+            servo_slew_rud   = slew_limit_f(servo_slew_rud,   desire_rud,   slew_lim);
+
+            uint16_t target_ail_L = (uint16_t)(servo_slew_ail_L + 0.5f);
+            uint16_t target_ail_R = (uint16_t)(servo_slew_ail_R + 0.5f);
+            uint16_t target_ele   = (uint16_t)(servo_slew_ele   + 0.5f);
+            uint16_t target_rud   = (uint16_t)(servo_slew_rud   + 0.5f);
+
+            pwm.aileron_L = apply_hyst_u16(pwm.aileron_L, target_ail_L, hyst_us);
+            pwm.aileron_R = apply_hyst_u16(pwm.aileron_R, target_ail_R, hyst_us);
+            pwm.elevator  = apply_hyst_u16(pwm.elevator,  target_ele,   hyst_us);
+            pwm.rudder    = apply_hyst_u16(pwm.rudder,    target_rud,   hyst_us);
+
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm.aileron_L);
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm.aileron_R);
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm.elevator);
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pwm.rudder);
+
+            /* 6. Penjadwalan MAVLink Bertahap (1 paket tiap 40 ms -> 0 ms CPU blocking) */
+            if ((now - waktu_telem) >= TELEM_STEP_MS)
             {
-                if (fabsf(err_roll) > 0.0f)
+                waktu_telem = now;
+
+                if ((now - waktu_hb) >= 1000U)
                 {
-                    pid.i_roll = clamp_f(pid.i_roll + (pid.ki_roll * err_roll * mpu.dt), -120.0f, 120.0f);
+                    waktu_hb = now;
+                    mavlink_msg_heartbeat_pack(
+                        SYS_ID, COMP_ID_FC, &msg_tx,
+                        MAV_TYPE_FIXED_WING, MAV_AUTOPILOT_ARDUPILOTMEGA,
+                        MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | MAV_MODE_FLAG_SAFETY_ARMED,
+                        flight_mode, MAV_STATE_ACTIVE);
+                    MAVLink_SendPacketNonBlocking(&msg_tx);
                 }
-                if (fabsf(err_pitch) > 0.0f)
+                else
                 {
-                    pid.i_pitch = clamp_f(pid.i_pitch + (pid.ki_pitch * err_pitch * mpu.dt), -120.0f, 120.0f);
+                    switch (telem_slot)
+                    {
+                        case 0U:
+                        case 3U:
+                            mavlink_msg_attitude_pack(
+                                SYS_ID, COMP_ID_FC, &msg_tx, now,
+                                mpu.roll_filt * DEG_TO_RAD, mpu.pitch_filt * DEG_TO_RAD, mpu.kalmanZ * DEG_TO_RAD,
+                                mpu.gyroX_filt * DEG_TO_RAD, mpu.gyroY_filt * DEG_TO_RAD, mpu.gyroZ_filt * DEG_TO_RAD);
+                            MAVLink_SendPacketNonBlocking(&msg_tx);
+                            break;
+
+                        case 1U:
+                        case 4U:
+                        {
+                            uint8_t rc_rssi = ((rc_hold_active != 0U) || (mav_rc_ok != 0U)) ? 255U : 0U;
+                            mavlink_msg_rc_channels_pack(
+                                SYS_ID, COMP_ID_FC, &msg_tx,
+                                now, 16U,
+                                active_rc_us[0],  active_rc_us[1],  active_rc_us[2],  active_rc_us[3],
+                                active_rc_us[4],  active_rc_us[5],  active_rc_us[6],  active_rc_us[7],
+                                active_rc_us[8],  active_rc_us[9],  active_rc_us[10], active_rc_us[11],
+                                active_rc_us[12], active_rc_us[13], active_rc_us[14], active_rc_us[15],
+                                UINT16_MAX, UINT16_MAX, rc_rssi);
+                            MAVLink_SendPacketNonBlocking(&msg_tx);
+                            break;
+                        }
+
+                        case 2U:
+                            mavlink_msg_servo_output_raw_pack(
+                                SYS_ID, COMP_ID_FC, &msg_tx,
+                                now * 1000U, 0U,
+                                pwm.aileron_L, pwm.aileron_R, pwm.elevator, pwm.rudder,
+                                0U, 0U, 0U, 0U,
+                                0U, 0U, 0U, 0U,
+                                0U, 0U, 0U, 0U);
+                            MAVLink_SendPacketNonBlocking(&msg_tx);
+                            break;
+
+                        default:
+                        {
+                            float heading_deg_f = fmodf(mpu.kalmanZ, 360.0f);
+                            if (heading_deg_f < 0.0f) heading_deg_f += 360.0f;
+                            int16_t  heading_deg  = (int16_t)heading_deg_f;
+                            uint16_t heading_cdeg = (uint16_t)(heading_deg_f * 100.0f);
+                            int32_t  alt_mm       = (int32_t)(bmp.ketinggian_filter * 1000.0f);
+                            int16_t  vz_cms       = (int16_t)(-bmp.climb_mps * 100.0f);
+
+                            mavlink_msg_global_position_int_pack(
+                                SYS_ID, COMP_ID_FC, &msg_tx, now,
+                                0, 0, alt_mm, alt_mm, 0, 0, vz_cms, heading_cdeg);
+                            MAVLink_SendPacketNonBlocking(&msg_tx);
+
+                            uint16_t thr_pct = (active_rc_us[2] <= 1000U) ? 0U : (uint16_t)((active_rc_us[2] - 1000U) / 10U);
+                            if (thr_pct > 100U) thr_pct = 100U;
+                            mavlink_msg_vfr_hud_pack(
+                                SYS_ID, COMP_ID_FC, &msg_tx,
+                                0.0f, 0.0f, heading_deg, thr_pct,
+                                bmp.ketinggian_filter, bmp.climb_mps);
+                            MAVLink_SendPacketNonBlocking(&msg_tx);
+                            break;
+                        }
+                    }
+                    telem_slot = (uint8_t)((telem_slot + 1U) % 6U);
                 }
             }
-            else
+
+            /* 7. Laporan Status PID, Sensor & Statistik Link RC ke Mission Planner */
+            if ((now - waktu_rc_diag) >= RC_DIAG_MS)
             {
-                pid.i_roll  = 0.0f;
-                pid.i_pitch = 0.0f;
-            }
+                waktu_rc_diag = now;
+                char diag_str[50];
+                const char *mode_name = (flight_mode == PLANE_MODE_STABILIZE) ? "PID-STAB" :
+                                        ((flight_mode == PLANE_MODE_AUTO) ? "PID-AUTO" : "MANUAL");
+                const uint8_t mpu_ok = ((mpu.ready != 0U) && (mpu_fault == 0U)) ? 1U : 0U;
 
-            float raw_pid_roll  = (pid.kp_roll  * err_roll)  + pid.i_roll  - (pid.kd_roll  * mpu.gyroX_filt);
-            float raw_pid_pitch = (pid.kp_pitch * err_pitch) + pid.i_pitch - (pid.kd_pitch * mpu.gyroY_filt);
-            float raw_pid_yaw   = (stick_yaw * 500.0f) - (pid.kp_yaw * mpu.gyroZ_filt);
-
-            raw_pid_roll  = clamp_f(raw_pid_roll,  -500.0f, 500.0f);
-            raw_pid_pitch = clamp_f(raw_pid_pitch, -500.0f, 500.0f);
-            raw_pid_yaw   = clamp_f(raw_pid_yaw,   -500.0f, 500.0f);
-
-            pid.smooth_roll_us  += 0.25f * (raw_pid_roll  - pid.smooth_roll_us);
-            pid.smooth_pitch_us += 0.25f * (raw_pid_pitch - pid.smooth_pitch_us);
-            pid.smooth_yaw_us   += 0.25f * (raw_pid_yaw   - pid.smooth_yaw_us);
-
-            out_roll_us  = pid.smooth_roll_us;
-            out_pitch_us = pid.smooth_pitch_us;
-            out_yaw_us   = pid.smooth_yaw_us;
-        }
-
-        uint16_t target_ail_L = (uint16_t)(clamp_f(1500.0f + pwm.trim_roll_L + (pwm.dir_roll_L * out_roll_us),  1000.0f, 2000.0f) + 0.5f);
-        uint16_t target_ail_R = (uint16_t)(clamp_f(1500.0f + pwm.trim_roll_R + (pwm.dir_roll_R * out_roll_us),  1000.0f, 2000.0f) + 0.5f);
-        uint16_t target_ele   = (uint16_t)(clamp_f(1500.0f + pwm.trim_pitch  + (pwm.dir_pitch  * out_pitch_us), 1000.0f, 2000.0f) + 0.5f);
-        uint16_t target_rud   = (uint16_t)(clamp_f(1500.0f + pwm.trim_yaw    + (pwm.dir_yaw    * out_yaw_us),   1000.0f, 2000.0f) + 0.5f);
-
-        pwm.aileron_L = apply_deadband_u16(pwm.aileron_L, target_ail_L, SERVO_DEADBAND_US);
-        pwm.aileron_R = apply_deadband_u16(pwm.aileron_R, target_ail_R, SERVO_DEADBAND_US);
-        pwm.elevator  = apply_deadband_u16(pwm.elevator,  target_ele,   SERVO_DEADBAND_US);
-        pwm.rudder    = apply_deadband_u16(pwm.rudder,    target_rud,   SERVO_DEADBAND_US);
-
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm.aileron_L);
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pwm.aileron_R);
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pwm.elevator);
-        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pwm.rudder);
-
-        /* 5. Kirim Telemetri MAVLink v2 ke Mission Planner (20 Hz) */
-        if ((waktu_sekarang - waktu_telem) >= TELEM_UPDATE_MS)
-        {
-            waktu_telem = waktu_sekarang;
-            uint16_t total_len = 0U;
-
-            if ((waktu_sekarang - waktu_hb) >= 1000U)
-            {
-                waktu_hb = waktu_sekarang;
-                mavlink_msg_heartbeat_pack(
-                    SYS_ID, COMP_ID_FC, &msg_hb,
-                    MAV_TYPE_FIXED_WING, MAV_AUTOPILOT_ARDUPILOTMEGA,
-                    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED | MAV_MODE_FLAG_SAFETY_ARMED,
-                    flight_mode, MAV_STATE_ACTIVE);
-                total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_hb);
-            }
-
-            mavlink_msg_attitude_pack(
-                SYS_ID, COMP_ID_FC, &msg_att, waktu_sekarang,
-                mpu.roll_filt * DEG_TO_RAD, mpu.pitch_filt * DEG_TO_RAD, mpu.kalmanZ * DEG_TO_RAD,
-                mpu.gyroX_filt * DEG_TO_RAD, mpu.gyroY_filt * DEG_TO_RAD, mpu.gyroZ_filt * DEG_TO_RAD);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_att);
-
-            float heading_deg_f = fmodf(mpu.kalmanZ, 360.0f);
-            if (heading_deg_f < 0.0f) heading_deg_f += 360.0f;
-            int16_t  heading_deg  = (int16_t)heading_deg_f;
-            uint16_t heading_cdeg = (uint16_t)(heading_deg_f * 100.0f);
-            int32_t  alt_mm       = (int32_t)(bmp.ketinggian_filter * 1000.0f);
-            int16_t  vz_cms       = (int16_t)(-bmp.climb_mps * 100.0f);
-
-            mavlink_msg_global_position_int_pack(
-                SYS_ID, COMP_ID_FC, &msg_gpos, waktu_sekarang,
-                0, 0, alt_mm, alt_mm, 0, 0, vz_cms, heading_cdeg);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_gpos);
-
-            uint16_t thr_pct = (active_rc_us[2] <= 1000U) ? 0U : (uint16_t)((active_rc_us[2] - 1000U) / 10U);
-            if (thr_pct > 100U) thr_pct = 100U;
-
-            mavlink_msg_vfr_hud_pack(
-                SYS_ID, COMP_ID_FC, &msg_vfr,
-                0.0f, 0.0f, heading_deg, thr_pct,
-                bmp.ketinggian_filter, bmp.climb_mps);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_vfr);
-
-            mavlink_msg_servo_output_raw_pack(
-                SYS_ID, COMP_ID_FC, &msg_servo,
-                waktu_sekarang * 1000U, 0U,
-                pwm.aileron_L, pwm.aileron_R, pwm.elevator, pwm.rudder,
-                0U, 0U, 0U, 0U,
-                0U, 0U, 0U, 0U,
-                0U, 0U, 0U, 0U);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_servo);
-
-            uint8_t rc_rssi = ((rc_hold_active != 0U) || (mav_rc_ok != 0U)) ? 255U : 0U;
-            mavlink_msg_rc_channels_pack(
-                SYS_ID, COMP_ID_FC, &msg_rc,
-                waktu_sekarang, 16U,
-                active_rc_us[0],  active_rc_us[1],  active_rc_us[2],  active_rc_us[3],
-                active_rc_us[4],  active_rc_us[5],  active_rc_us[6],  active_rc_us[7],
-                active_rc_us[8],  active_rc_us[9],  active_rc_us[10], active_rc_us[11],
-                active_rc_us[12], active_rc_us[13], active_rc_us[14], active_rc_us[15],
-                UINT16_MAX, UINT16_MAX, rc_rssi);
-            total_len += (uint16_t)mavlink_msg_to_send_buffer(&usb_tx_buf[total_len], &msg_rc);
-
-            if (total_len > 0U)
-            {
-                (void)CDC_Transmit_FS(usb_tx_buf, total_len);
-                memcpy(uart_tx_buf, usb_tx_buf, total_len);
-                UART1_TransmitNonBlockingRC(uart_tx_buf, total_len);
-            }
-        }
-
-        /* 6. Laporan Status Mode & Remote ke tab Messages Mission Planner */
-        if ((waktu_sekarang - waktu_rc_diag) >= RC_DIAG_MS)
-        {
-            waktu_rc_diag = waktu_sekarang;
-            char diag_str[50];
-            const char *mode_name = (flight_mode == PLANE_MODE_MANUAL) ? "MANUAL" :
-                                    ((flight_mode == PLANE_MODE_STABILIZE) ? "STABILIZE" : "AUTO");
-
-            if (rc_hold_active != 0U)
-            {
                 (void)snprintf(diag_str, sizeof(diag_str),
-                    "[%s] CH1:%u CH5:%u GLT:%lu",
-                    mode_name, active_rc_us[0], active_rc_us[4],
-                    (unsigned long)rc_glitches_blocked);
+                    "[%s] MPU:%s R:%.1f P:%.1f CH5:%u",
+                    mode_name,
+                    (mpu_ok != 0U) ? "OK" : "ERR",
+                    (double)mpu.roll_filt,
+                    (double)mpu.pitch_filt,
+                    active_rc_us[4]);
+                MAVLink_SendStatusText((mpu_ok != 0U) ? MAV_SEVERITY_INFO : MAV_SEVERITY_WARNING, diag_str);
+
+                /* Statistik link RC per 2 detik (integer saja, aman tanpa printf-float):
+                   p  = protokol terdeteksi (0 SBUS-inverted, 1 SBUS, 2 CRSF)
+                   L  = 1 jika protokol sudah terkunci
+                   fr = frame valid (CRSF: termasuk frame LinkStats, jadi sedikit lebih banyak dari laju RC)
+                   er = error UART RC, gl = lonjakan > 20 us yang diredam filter median */
+                static uint32_t fr_prev = 0U, er_prev = 0U, gl_prev = 0U;
+                const uint32_t fr_now = rc_valid_frames;
+                const uint32_t er_now = rc_uart_errors;
+                const uint32_t gl_now = rc_glitches_blocked;
+
+                (void)snprintf(diag_str, sizeof(diag_str),
+                    "RC p:%u L:%u fr:%lu er:%lu gl:%lu",
+                    (unsigned)rc_protocol_mode,
+                    (unsigned)rc_proto_locked,
+                    (unsigned long)(fr_now - fr_prev),
+                    (unsigned long)(er_now - er_prev),
+                    (unsigned long)(gl_now - gl_prev));
                 MAVLink_SendStatusText(MAV_SEVERITY_INFO, diag_str);
-            }
-            else if (rc_total_bytes > 0U || rc_uart_errors > 0U)
-            {
-                (void)snprintf(diag_str, sizeof(diag_str),
-                    "[%s] RC SYNC B:%lu E:%lu %02X %02X",
-                    mode_name, (unsigned long)rc_total_bytes, (unsigned long)rc_uart_errors,
-                    last_raw_bytes[0], last_raw_bytes[1]);
-                MAVLink_SendStatusText(MAV_SEVERITY_WARNING, diag_str);
-            }
-            else
-            {
-                (void)snprintf(diag_str, sizeof(diag_str),
-                    "[%s] RC PA3 KOSONG (Cek receiver -> PA3)", mode_name);
-                MAVLink_SendStatusText(MAV_SEVERITY_WARNING, diag_str);
-            }
-        }
 
-        uint32_t led_interval = (flight_mode == PLANE_MODE_MANUAL) ? 300U : 100U;
-        if ((waktu_sekarang - waktu_led) >= led_interval)
-        {
-            waktu_led = waktu_sekarang;
-            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        }
+                fr_prev = fr_now;
+                er_prev = er_now;
+                gl_prev = gl_now;
+            }
 
-        DelayAndPollUart(10U);
-        waktu_sebelumnya = waktu_sekarang;
+            uint32_t led_interval = (flight_mode == PLANE_MODE_MANUAL) ? 300U : 100U;
+            if ((now - waktu_led) >= led_interval)
+            {
+                waktu_led = now;
+                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            }
+
+            /* Refresh Watchdog hanya jika loop kontrol 100 Hz berjalan normal */
+            (void)HAL_IWDG_Refresh(&hiwdg);
+        }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
